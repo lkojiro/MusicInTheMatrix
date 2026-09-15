@@ -109,6 +109,15 @@ void MatrixRainRenderer::setupColors() {
         return;
     }
     start_color();
+    // Lets -1 mean "the terminal's own default background" in init_pair()
+    // below, rather than every pair needing a real, opaque palette entry.
+    // Without this, every character's cell painted an opaque
+    // RGB(0,0,0) square behind it (COLOR_BLACK is a real, opaque color,
+    // not a "leave it alone" sentinel) -- visible as a black square
+    // around each falling character on a semi-transparent terminal,
+    // instead of the glyph sitting directly on whatever's behind the
+    // window.
+    use_default_colors();
     colorEnabled_ = true;
     extendedColor_ = (COLORS >= 256);
 
@@ -128,13 +137,16 @@ void MatrixRainRenderer::setupColors() {
             238, 236,
         };
         for (int level = 0; level < kBrightnessLevels; ++level) {
-            init_pair(static_cast<short>(level + 1), kRamp[level], COLOR_BLACK);
+            // -1 background (not COLOR_BLACK): see the use_default_colors()
+            // comment above.
+            init_pair(static_cast<short>(level + 1), kRamp[level], -1);
         }
     } else {
         // Basic terminal fallback: white head, base-color trail,
-        // differentiated further with A_BOLD in draw().
-        init_pair(1, COLOR_WHITE, COLOR_BLACK);
-        init_pair(2, static_cast<short>(basicAnsiColorIndex(getGlobalConfig().baseColor)), COLOR_BLACK);
+        // differentiated further with A_BOLD in draw(). -1 background,
+        // same reasoning as above.
+        init_pair(1, COLOR_WHITE, -1);
+        init_pair(2, static_cast<short>(basicAnsiColorIndex(getGlobalConfig().baseColor)), -1);
     }
 }
 

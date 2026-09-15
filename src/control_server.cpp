@@ -62,14 +62,17 @@ constexpr const char* kControlPanelHtml = R"HTML(<!doctype html>
 <h1>Music in the Matrix</h1>
 <p class="sub">control panel -- polls every second</p>
 <div id="banner">Can't reach the host. It may have quit -- this page won't recover on its own.</div>
-<div id="toolbar"><button class="primary" onclick="spawn()">+ Spawn Window</button></div>
+<div id="toolbar">
+  <button class="primary" onclick="spawn()">+ Spawn Window</button>
+  <button onclick="randomizeAll()">🎲 Randomize All</button>
+</div>
 <table>
   <thead><tr><th>Window</th><th>Mode</th><th>Color</th><th></th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
 <script>
 const COLORS = ["red", "green", "blue", "yellow", "cyan", "magenta", "white"];
-const MODES = ["bars", "matrix", "checkerboard"];
+const MODES = ["bars-left", "bars-right", "bars-middle", "matrix", "checkerboard"];
 const SWATCH_HEX = {
   red: "#f33", green: "#3f3", blue: "#39f", yellow: "#ee3",
   cyan: "#3ee", magenta: "#e3e", white: "#eee"
@@ -107,6 +110,24 @@ function spawn() { post("/api/spawn"); }
 function closeWindow(id) { post("/api/close", { id }); }
 function setMode(id, mode) { post("/api/mode", { id, mode }); }
 function setColor(id, color) { post("/api/color", { id, color }); }
+
+function randomPick(list) { return list[Math.floor(Math.random() * list.length)]; }
+
+// Fetches a fresh window list rather than reusing whatever render() last
+// drew, so a window that connected or disconnected a moment ago (outside
+// this page's own 1s poll cycle) doesn't get skipped or 404 -- each
+// window's mode and color are picked independently, not the same pair
+// for all of them.
+async function randomizeAll() {
+  const r = await fetch("/api/state");
+  if (!r.ok) return;
+  const data = await r.json();
+  await Promise.all(data.windows.flatMap(w => [
+    post("/api/mode", { id: w.displayNumber, mode: randomPick(MODES) }),
+    post("/api/color", { id: w.displayNumber, color: randomPick(COLORS) }),
+  ]));
+  poll(); // don't wait up to 1s to see the result
+}
 
 // render() replaces every row's innerHTML wholesale, <select> elements
 // included -- fine most of the time, but destroying and recreating a

@@ -6,7 +6,7 @@ namespace mitm {
 
 // Parsed command-line invocation. Modes share one binary:
 //
-//   mitm [device-name-substring] [--visual=bars|matrix|checkerboard] [--color=NAME]
+//   mitm [device-name-substring] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard] [--color=NAME]
 //       Default: auto-discovers whether a host is already running (see
 //       host_discovery.hpp) and either becomes the host (runHost) or
 //       connects to the existing one as a child (runSubordinate) -- see
@@ -32,10 +32,16 @@ namespace mitm {
 //       sequential id) when it finds an existing host. Not normally run
 //       by hand.
 //
-// --visual=bars (default) is the FFT bar chart; --visual=matrix is the
-// Matrix-style digital rain; --visual=checkerboard is the beat-flash grid.
-// This only picks the *starting* mode -- every window can switch live
-// between them with the left/right arrow keys (see curses_util::InputAction).
+// --visual=bars-left (default, "bars" also accepted as an alias) is the
+// FFT bar chart, bucket 0 at the left edge increasing rightward;
+// --visual=bars-right is the same chart mirrored (bucket 0 at the right
+// edge increasing leftward); --visual=bars-middle centers bucket 0 and
+// mirrors every other bucket outward to both sides at once (see
+// BarLayout in terminal_renderer.hpp for what each one actually draws).
+// --visual=matrix is the Matrix-style digital rain; --visual=checkerboard
+// is the beat-flash grid. This only picks the *starting* mode -- every
+// window can switch live between all five with the left/right arrow keys
+// (see curses_util::InputAction).
 //
 // --color=NAME (default "green") picks the base hue every renderer's
 // brightness ramp is derived from -- see color_scheme.hpp. One of red,

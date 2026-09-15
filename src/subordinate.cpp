@@ -44,7 +44,7 @@ struct SharedState {
     std::atomic<bool> active{false};
     std::atomic<bool> shutdownRequested{false};
     std::atomic<int> displayNumber{-1}; // -1 until the first ConfigMessage arrives
-    std::atomic<VisualMode> mode{VisualMode::Bars};
+    std::atomic<VisualMode> mode{VisualMode::BarsLeft};
     std::mutex colorNameMutex; // guards colorName (not atomic-friendly)
     std::string colorName;
 };
@@ -239,6 +239,7 @@ int runSubordinate(const AppArgs& args) {
         }
         if (currentMode != lastReportedMode || currentColorName != lastReportedColorName) {
             if (currentColorName != lastReportedColorName) {
+                barsRenderer.setupColors();
                 matrixRenderer.setupColors();
                 checkerboardRenderer.setupColors();
             }
@@ -259,8 +260,14 @@ int runSubordinate(const AppArgs& args) {
             }
 
             switch (currentMode) {
-                case VisualMode::Bars:
-                    barsRenderer.draw(buckets);
+                case VisualMode::BarsLeft:
+                    barsRenderer.draw(buckets, BarLayout::Left);
+                    break;
+                case VisualMode::BarsRight:
+                    barsRenderer.draw(buckets, BarLayout::Right);
+                    break;
+                case VisualMode::BarsMiddle:
+                    barsRenderer.draw(buckets, BarLayout::Middle);
                     break;
                 case VisualMode::Matrix:
                     matrixRenderer.draw(loudness, beatDetected);

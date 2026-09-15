@@ -110,7 +110,9 @@ with an error listing the input devices it did find.
 ## Running
 
 ```sh
-./build/mitm                              # starts in bars mode, green
+./build/mitm                              # starts in Bars Left mode, green
+./build/mitm --visual=bars-right          # bucket 0 at the right edge instead
+./build/mitm --visual=bars-middle         # bucket 0 centered, mirrored outward
 ./build/mitm --visual=matrix              # starts in Matrix rain mode
 ./build/mitm --visual=checkerboard        # starts in Checkerboard mode
 ./build/mitm --color=purple               # any mode, any color (default green)
@@ -123,8 +125,8 @@ only sets *this* window's own color, though -- see the next paragraph for
 what a window spawned via `n` gets instead.
 
 Press `q` to quit, the **left/right arrow keys** to cycle live between all
-three modes (`--visual` only picks the starting one now), or **`n`** to
-spawn a brand new window (same audio device, starts in bars mode). Each
+five modes (`--visual` only picks the starting one now), or **`n`** to
+spawn a brand new window (same audio device, starts in Bars Left mode). Each
 window has its own color rather than inheriting one from whoever spawned
 it -- a window's `BaseColor` lives in its own process's `GlobalConfig`
 (see **Shared infrastructure** below), so nothing here is actually shared
@@ -255,7 +257,7 @@ of the above, as a manual/scriptable alternative that doesn't rely on
 auto-discovery:
 
 ```sh
-./build/mitm --controller [--count=N] [--socket=PATH] [--visual=bars|matrix|checkerboard] [--color=NAME]
+./build/mitm --controller [--count=N] [--socket=PATH] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard] [--color=NAME]
                                            # spawns N Terminal windows up front and rotates
                                            # which one is "active" every 5s, without rendering
                                            # anything itself (unlike the host).
@@ -280,13 +282,39 @@ page, no build step, no external requests (everything it does is a
 `fetch()` back to this same server): a row per window (host included),
 each with a mode dropdown, a color dropdown, and a Close button (the
 host's row says "Quit All" instead, since closing window 0 *is* closing
-the host -- same cascade as `q`), plus a "+ Spawn Window" button. It
-polls `GET /api/state` once a second and just re-renders; every action
-(`POST /api/spawn`, `/api/close`, `/api/mode`, `/api/color`, the latter
-three taking a small JSON body keyed by the window's *display* number,
-never its real pid) fires and waits for the next poll to confirm it,
-rather than updating optimistically itself -- simple, at the cost of up
-to ~1s before a change is visibly confirmed in the browser.
+the host -- same cascade as `q`), plus a "+ Spawn Window" button and a
+"🎲 Randomize All" one. It polls `GET /api/state` once a second and just
+re-renders; every action (`POST /api/spawn`, `/api/close`, `/api/mode`,
+`/api/color`, the latter three taking a small JSON body keyed by the
+window's *display* number, never its real pid) fires and waits for the
+next poll to confirm it, rather than updating optimistically itself --
+simple, at the cost of up to ~1s before a change is visibly confirmed in
+the browser. Randomize All doesn't add a route of its own -- it's
+client-side only, fetching a fresh window list (so a window that just
+connected or disconnected, outside this page's own poll cycle, isn't
+skipped or 404s) and firing an independent `/api/mode` + `/api/color`
+pair per window, each picked separately so windows don't all land on the
+same mode/color together.
+
+Two real gotchas this surfaced:
+
+- **A poll landing mid-interaction could yank a dropdown out from under
+  you.** `render()` replaces every row's innerHTML wholesale, `<select>`
+  elements included -- destroying and recreating one out from under an
+  open (or just-changed-but-not-yet-confirmed) dropdown closes it and
+  can make the choice look like it silently reverted, since the rebuilt
+  element gets its selected option from whatever state was last polled,
+  not the pick that hadn't been confirmed back yet. Fixed by skipping a
+  poll's render entirely while any `<select>` in the table has focus,
+  and catching up immediately (rather than waiting up to 1s) via a
+  `focusout` listener the moment focus leaves one.
+- **A taken port crashed the whole host, not just the web panel.**
+  `ControlServer`'s constructor throws on `bind()` failure (e.g. a
+  previous host that didn't shut down cleanly still holding the port),
+  and that exception was going uncaught -- turning a missing nice-to-have
+  into a dead visualizer. Same fix as audio's best-effort startup: wrap
+  the construction in try/catch and keep running without the web panel,
+  rather than let an unrelated subsystem's failure take down rendering.
 
 Only the host runs this -- it's the only process with a view of every
 window, so it's the natural single control point (same reasoning as `n`
@@ -373,6 +401,61 @@ only colors foreground text, using pairs 1-8, not background colors with
 pairs 20+). `redrawwin()` is now load-bearing, not a style choice; see the
 comment at its call site in `checkerboard_renderer.cpp`.
 
+## Semi-transparent terminal windows: opaque squares aren't a drawing bug
+
+A user running mitm in a Terminal.app window with a translucent background
+(opacity turned down in the profile) noticed every "empty" cell rendered
+as an opaque black square instead of showing the desktop through, like
+the terminal's own genuinely-blank areas do. The natural first guess --
+and a completely reasonable one -- was that the renderers were
+explicitly painting those cells `COLOR_BLACK` (an opaque RGB(0,0,0))
+instead of leaving them alone, and that just not drawing there would fix
+it.
+
+That guess was half right: `CheckerboardRenderer` did explicitly repaint
+every "off" cell `COLOR_BLACK`/`COLOR_BLACK` every frame, and every
+`MatrixRainRenderer` color pair used `COLOR_BLACK` as its background --
+neither renderer called `use_default_colors()`, so there was no way to
+say "leave the terminal's own background alone" in the first place, only
+"paint an opaque color" vs. "paint a different opaque color." Both were
+switched to `-1` (the default-color sentinel, after `use_default_colors()`)
+for exactly the cells/pairs that should show through.
+
+It didn't fix it. Isolating why took two comparison tests, both against
+the same translucent Terminal.app window and verified by direct
+screenshot (not just "looks right by eye"):
+
+1. **A totally blank, freshly-cleared shell prompt** in an identical
+   translucent window showed the desktop through correctly -- confirming
+   the translucency setting and the screenshot method both actually work,
+   ruling out "the effect doesn't really apply" or "screenshots can't
+   capture it."
+2. **`vim`** -- a completely unrelated, stock ncurses application with
+   zero code in common with this project -- opened in the same
+   translucent window and showed the exact same flat opaque black
+   background in its main editing area that mitm did.
+
+Since `vim`'s renderer has nothing to do with this codebase, the only
+thing it and mitm share is switching the terminal into its *alternate
+screen buffer* (the `smcup`/`rmcup` terminfo capability `initscr()` uses
+for any full-screen TUI app, so the shell's original scrollback is
+restored on exit). That match, plus the blank-shell-prompt control
+showing the desktop through correctly, points at the real cause:
+**Terminal.app renders the alternate screen buffer opaquely regardless
+of the window's transparency setting** -- a renderer-level behavior that
+applies to any full-screen terminal app, not something happening in this
+codebase's drawing code, and not fixable by changing what gets painted
+or skipping paints entirely (both were tried; neither changed anything).
+
+The `use_default_colors()`/`-1` change was kept anyway -- it's more
+correct regardless (an explicit `COLOR_BLACK` and "the terminal's actual
+default background" aren't the same thing even when they look the same,
+and some other terminal emulator might not share Terminal.app's
+alternate-screen-buffer behavior, though that's untested here) -- but it
+doesn't fix transparency in Terminal.app specifically. If genuine
+translucency behind a running mitm window matters, the terminal emulator
+itself is the lever to pull, not this codebase.
+
 ## Shared infrastructure
 
 Two small modules exist purely as scaffolding for future effects, not
@@ -385,7 +468,11 @@ because anything currently needs their full capability:
   instead of each hardcoding its own ramp -- `CheckerboardRenderer`'s
   ramp is a direct swap; `MatrixRainRenderer` keeps its bespoke near-white
   pulse-head and dark-gray tail steps (neither is really "about" the base
-  hue) and only derives its middle 5 levels this way. The default
+  hue) and only derives its middle 5 levels this way; `TerminalRenderer`
+  (bars mode) doesn't use `makeBrightnessRamp()` at all -- there's no
+  "levels" concept for a single solid-colored `#`, so it just goes
+  straight to `cubeToXterm256()` (or `basicAnsiColorIndex()`, same
+  fallback as the other two) for one full-brightness pair. The default
   (green, `{0,5,0}`) reproduces the exact palette indices that used to be
   hardcoded, so nothing changed visually unless `--color` is passed.
   `parseColorName()` maps `--color`'s named presets (red/green/blue/
@@ -449,11 +536,26 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
 - `BeatDetector`: RMS loudness (adaptive running-max normalized) plus
   spectral-flux beat pulses (adaptive mean+stddev threshold, refractory
   period) -- see the license writeup above for why this is hand-rolled.
-- `TerminalRenderer` (bars mode): draws one stacked column of `#` per
-  bucket, sized to the current terminal, each capped with a peak-hold `_`
-  marker that snaps up instantly and decays back down over time; a
-  constant `_` baseline along the bottom row keeps quiet audio from
-  looking totally blank.
+- `TerminalRenderer` (Bars Left/Right/Middle modes): draws one stacked
+  column of `#` per bucket, sized to the current terminal, each capped
+  with a peak-hold `_` marker that snaps up instantly and decays back
+  down over time; a constant `_` baseline along the bottom row keeps
+  quiet audio from looking totally blank. `BarLayout` (see
+  `terminal_renderer.hpp`) picks where bucket 0 sits and which way
+  frequency increases from there -- `Left` (bucket 0 at the left edge,
+  increasing rightward, the original layout) and `Right` (the same
+  chart, mirrored left-right) are one screen-column slot per bucket;
+  `Middle` centers bucket 0 and mirrors every other bucket the same
+  distance out on *both* sides at once, so it needs roughly twice the
+  slots for the same bucket count. Peak-hold state is keyed by bucket,
+  not screen column, so it carries over cleanly across all three
+  layouts. The `#` bars are colored from the window's
+  `GlobalConfig::baseColor` (see **Shared infrastructure** below), same
+  as the other two modes -- the peak-hold and baseline `_` markers stay
+  the terminal's plain default foreground on purpose, so the color reads
+  as "the bar" and not "the whole chart." Unlike Matrix rain and
+  Checkerboard, there's no brightness ramp here -- no notion of
+  "levels" to shade between, just the one solid full-brightness hue.
 - `MatrixRainRenderer` (Matrix rain mode): falling character strings,
   spawning above the top edge and despawning past the bottom, fixed
   length chosen randomly at spawn, brightest at the head fading toward

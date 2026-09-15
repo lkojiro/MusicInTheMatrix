@@ -372,105 +372,116 @@ int runHost(const AppArgs& args) {
     // per-connection thread ControlServer handed the request to, so
     // anything touching children/windowOrder/hostColorName takes
     // childrenMutex, same as every other thread that touches them.
-    ControlServer webServer(args.webPort, [&](const HttpRequest& req) -> HttpResponse {
-        if (req.method == "GET" && req.path == "/api/state") {
-            nlohmann::json windows = nlohmann::json::array();
+    // Best-effort, same philosophy as audio above: a taken port (e.g. a
+    // previous host that didn't shut down cleanly, or something else on
+    // this machine using it) shouldn't crash the whole visualizer --
+    // ControlServer's constructor throws on bind() failure, so this is
+    // an actual try/catch, not just a defensive one.
+    std::unique_ptr<ControlServer> webServer;
+    try {
+        webServer = std::make_unique<ControlServer>(args.webPort, [&](const HttpRequest& req) -> HttpResponse {
+            if (req.method == "GET" && req.path == "/api/state") {
+                nlohmann::json windows = nlohmann::json::array();
+                {
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    for (size_t i = 0; i < windowOrder.size(); ++i) {
+                        int id = windowOrder[i];
+                        nlohmann::json w;
+                        w["displayNumber"] = static_cast<int>(i);
+                        if (id == ownId) {
+                            w["isHost"] = true;
+                            w["mode"] = visualModeName(mode.load());
+                            w["colorName"] = hostColorName;
+                        } else {
+                            w["isHost"] = false;
+                            auto it = children.find(id);
+                            w["mode"] = it != children.end() ? it->second.mode : "";
+                            w["colorName"] = it != children.end() ? it->second.colorName : "";
+                        }
+                        windows.push_back(w);
+                    }
+                }
+                nlohmann::json result;
+                result["windows"] = windows;
+                return HttpResponse{200, "application/json", result.dump()};
+            }
+
+            if (req.method == "POST" && req.path == "/api/spawn") {
+                spawnChild(); // blocks ~0.3-1s (AppleScript) -- fine for a button click
+                return HttpResponse{200, "application/json", "{\"ok\":true}"};
+            }
+
+            // Every remaining route needs a JSON body with at least an
+            // integer "id" (a *display* number, e.g. what the web UI
+            // shows and what windowOrder indexes by -- not the real
+            // pid/handle underneath it, which the browser never sees).
+            nlohmann::json body = nlohmann::json::parse(req.body, /*cb=*/nullptr, /*allow_exceptions=*/false);
+            if (body.is_discarded() || !body.contains("id") || !body["id"].is_number_integer()) {
+                return HttpResponse{400, "application/json", "{\"ok\":false,\"error\":\"missing id\"}"};
+            }
+            int displayNumber = body["id"].get<int>();
+            int realId = -1;
             {
                 std::lock_guard<std::mutex> lock(childrenMutex);
-                for (size_t i = 0; i < windowOrder.size(); ++i) {
-                    int id = windowOrder[i];
-                    nlohmann::json w;
-                    w["displayNumber"] = static_cast<int>(i);
-                    if (id == ownId) {
-                        w["isHost"] = true;
-                        w["mode"] = visualModeName(mode.load());
-                        w["colorName"] = hostColorName;
-                    } else {
-                        w["isHost"] = false;
-                        auto it = children.find(id);
-                        w["mode"] = it != children.end() ? it->second.mode : "";
-                        w["colorName"] = it != children.end() ? it->second.colorName : "";
+                if (displayNumber >= 0 && static_cast<size_t>(displayNumber) < windowOrder.size()) {
+                    realId = windowOrder[static_cast<size_t>(displayNumber)];
+                }
+            }
+            if (realId < 0) {
+                return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such window\"}"};
+            }
+
+            if (req.method == "POST" && req.path == "/api/close") {
+                if (realId == ownId) {
+                    // Closing "window 0" means closing the host -- which
+                    // cascades to every child anyway (see the shutdown
+                    // code below), so that's exactly what quitting via
+                    // 'q' does.
+                    g_stopRequested = true;
+                } else {
+                    closeChildAsync(realId);
+                }
+                return HttpResponse{200, "application/json", "{\"ok\":true}"};
+            }
+
+            if (req.method == "POST" && req.path == "/api/mode") {
+                std::string modeName = body.value("mode", std::string("bars"));
+                if (realId == ownId) {
+                    mode = parseVisualMode(modeName);
+                } else {
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    auto it = children.find(realId);
+                    if (it != children.end() && it->second.connection) {
+                        it->second.connection->send(ipc::toJson(ipc::SetModeMessage{modeName}));
+                        it->second.mode = modeName; // optimistic -- the child's own state echo will confirm
                     }
-                    windows.push_back(w);
                 }
+                return HttpResponse{200, "application/json", "{\"ok\":true}"};
             }
-            nlohmann::json result;
-            result["windows"] = windows;
-            return HttpResponse{200, "application/json", result.dump()};
-        }
 
-        if (req.method == "POST" && req.path == "/api/spawn") {
-            spawnChild(); // blocks ~0.3-1s (AppleScript) -- fine for a button click
-            return HttpResponse{200, "application/json", "{\"ok\":true}"};
-        }
-
-        // Every remaining route needs a JSON body with at least an
-        // integer "id" (a *display* number, e.g. what the web UI shows
-        // and what windowOrder indexes by -- not the real pid/handle
-        // underneath it, which the browser never sees).
-        nlohmann::json body = nlohmann::json::parse(req.body, /*cb=*/nullptr, /*allow_exceptions=*/false);
-        if (body.is_discarded() || !body.contains("id") || !body["id"].is_number_integer()) {
-            return HttpResponse{400, "application/json", "{\"ok\":false,\"error\":\"missing id\"}"};
-        }
-        int displayNumber = body["id"].get<int>();
-        int realId = -1;
-        {
-            std::lock_guard<std::mutex> lock(childrenMutex);
-            if (displayNumber >= 0 && static_cast<size_t>(displayNumber) < windowOrder.size()) {
-                realId = windowOrder[static_cast<size_t>(displayNumber)];
-            }
-        }
-        if (realId < 0) {
-            return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such window\"}"};
-        }
-
-        if (req.method == "POST" && req.path == "/api/close") {
-            if (realId == ownId) {
-                // Closing "window 0" means closing the host -- which
-                // cascades to every child anyway (see the shutdown code
-                // below), so that's exactly what quitting via 'q' does.
-                g_stopRequested = true;
-            } else {
-                closeChildAsync(realId);
-            }
-            return HttpResponse{200, "application/json", "{\"ok\":true}"};
-        }
-
-        if (req.method == "POST" && req.path == "/api/mode") {
-            std::string modeName = body.value("mode", std::string("bars"));
-            if (realId == ownId) {
-                mode = parseVisualMode(modeName);
-            } else {
-                std::lock_guard<std::mutex> lock(childrenMutex);
-                auto it = children.find(realId);
-                if (it != children.end() && it->second.connection) {
-                    it->second.connection->send(ipc::toJson(ipc::SetModeMessage{modeName}));
-                    it->second.mode = modeName; // optimistic -- the child's own state echo will confirm
+            if (req.method == "POST" && req.path == "/api/color") {
+                std::string colorName = body.value("color", std::string("green"));
+                if (realId == ownId) {
+                    updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(colorName); });
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    hostColorName = colorName;
+                } else {
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    auto it = children.find(realId);
+                    if (it != children.end() && it->second.connection) {
+                        it->second.connection->send(ipc::toJson(ipc::SetColorMessage{colorName}));
+                        it->second.colorName = colorName; // optimistic, as above
+                    }
                 }
+                return HttpResponse{200, "application/json", "{\"ok\":true}"};
             }
-            return HttpResponse{200, "application/json", "{\"ok\":true}"};
-        }
 
-        if (req.method == "POST" && req.path == "/api/color") {
-            std::string colorName = body.value("color", std::string("green"));
-            if (realId == ownId) {
-                updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(colorName); });
-                std::lock_guard<std::mutex> lock(childrenMutex);
-                hostColorName = colorName;
-            } else {
-                std::lock_guard<std::mutex> lock(childrenMutex);
-                auto it = children.find(realId);
-                if (it != children.end() && it->second.connection) {
-                    it->second.connection->send(ipc::toJson(ipc::SetColorMessage{colorName}));
-                    it->second.colorName = colorName; // optimistic, as above
-                }
-            }
-            return HttpResponse{200, "application/json", "{\"ok\":true}"};
-        }
-
-        return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such route\"}"};
-    });
-    std::printf("Host: control panel at http://127.0.0.1:%d\n", args.webPort);
+            return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such route\"}"};
+        });
+        std::printf("Host: control panel at http://127.0.0.1:%d\n", args.webPort);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Host: web control panel unavailable (%s) -- continuing without it\n", e.what());
+    }
 
     std::vector<float> samples;
     std::vector<float> buckets;
@@ -503,6 +514,7 @@ int runHost(const AppArgs& args) {
         // pairs) happens here instead, once a frame.
         BaseColor currentColor = getGlobalConfig().baseColor;
         if (currentColor != lastAppliedColor) {
+            barsRenderer.setupColors();
             matrixRenderer.setupColors();
             checkerboardRenderer.setupColors();
             lastAppliedColor = currentColor;
@@ -521,8 +533,14 @@ int runHost(const AppArgs& args) {
         }
 
         switch (mode.load()) {
-            case VisualMode::Bars:
-                barsRenderer.draw(buckets);
+            case VisualMode::BarsLeft:
+                barsRenderer.draw(buckets, BarLayout::Left);
+                break;
+            case VisualMode::BarsRight:
+                barsRenderer.draw(buckets, BarLayout::Right);
+                break;
+            case VisualMode::BarsMiddle:
+                barsRenderer.draw(buckets, BarLayout::Middle);
                 break;
             case VisualMode::Matrix:
                 matrixRenderer.draw(loudness, beatDetected);

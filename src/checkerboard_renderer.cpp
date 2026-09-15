@@ -87,10 +87,26 @@ void CheckerboardRenderer::setupColors() {
         return;
     }
     start_color();
+    // Lets -1 mean "the terminal's own default background" in init_pair()
+    // below, instead of every color needing to be a real, opaque palette
+    // entry. Without this, COLOR_BLACK was the only way to say "dark" --
+    // but COLOR_BLACK is a real, opaque RGB(0,0,0), not a sentinel for
+    // "leave it alone", so every "off" cell was painting over a
+    // semi-transparent terminal's own background instead of letting it
+    // show through. use_default_colors() is what makes that distinction
+    // expressible at all.
+    use_default_colors();
     colorEnabled_ = true;
     extendedColor_ = (COLORS >= 256);
 
-    init_pair(kOffPair, COLOR_BLACK, COLOR_BLACK);
+    // -1/-1 (not COLOR_BLACK/COLOR_BLACK): an "off" cell should look like
+    // nothing was drawn there at all -- matching a semi-transparent
+    // terminal's own background -- not an opaque black square. Still
+    // painted explicitly every frame (not skipped) rather than just
+    // relying on erase() to have already blanked it, so this keeps the
+    // same "every cell gets a fresh, explicit paint" structure that
+    // redrawwin() below depends on -- see its own comment for why.
+    init_pair(kOffPair, -1, -1);
 
     BaseColor base = getGlobalConfig().baseColor;
 
