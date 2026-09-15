@@ -15,6 +15,14 @@ struct BaseColor {
     int r = 0;
     int g = 5;
     int b = 0; // default: green, matching the original hardcoded look
+
+    // Lets a render loop cheaply notice "did GlobalConfig::baseColor
+    // actually change since I last applied it" (see control_server.hpp's
+    // live color changes) without needing a separate dirty flag.
+    friend bool operator==(const BaseColor& a, const BaseColor& b) {
+        return a.r == b.r && a.g == b.g && a.b == b.b;
+    }
+    friend bool operator!=(const BaseColor& a, const BaseColor& b) { return !(a == b); }
 };
 
 // xterm-256 color-cube coordinates (each clamped to 0-5) -> palette index.

@@ -30,4 +30,15 @@ inline VisualMode parseVisualMode(const std::string& s) {
     return VisualMode::Bars;
 }
 
+// Inverse of parseVisualMode() -- used to report a window's current mode
+// over IPC (see ipc::StateMessage) and to the control server's web UI.
+inline std::string visualModeName(VisualMode mode) {
+    switch (mode) {
+        case VisualMode::Matrix: return "matrix";
+        case VisualMode::Checkerboard: return "checkerboard";
+        case VisualMode::Bars: return "bars";
+    }
+    return "bars";
+}
+
 } // namespace mitm

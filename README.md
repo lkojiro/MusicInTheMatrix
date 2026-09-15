@@ -134,6 +134,11 @@ whatever `--color` the spawning window happened to be started with.
 Expect a brief (~0.3-1s) pause in the window you pressed `n` in while the
 new one opens.
 
+All of the above -- spawning, closing, mode, color -- is also available
+from a browser: the host serves a small control panel at
+`http://127.0.0.1:7887` (override with `--web-port=N`). See **Web control
+panel** below.
+
 ## Multi-window: one host, any number of children
 
 Every plain `./build/mitm` invocation auto-discovers whether a host is
@@ -263,8 +268,65 @@ Each subordinate runs its own independent `AudioCapture` → `FftProcessor`
 → `BeatDetector` pipeline and just gates whether it actually renders based
 on activate/deactivate messages from the controller -- no audio or frame
 data crosses the socket, only tiny control messages (`hello`, `activate`,
-`bye`, `shutdown`, `config`), which keeps the protocol trivial regardless
-of how many windows are running.
+`bye`, `shutdown`, `config`, `spawn_request`, `set_mode`, `set_color`,
+`state`), which keeps the protocol trivial regardless of how many windows
+are running.
+
+## Web control panel
+
+The host also serves a small web UI, at `http://127.0.0.1:7887` by
+default (override with `--web-port=N`) -- see `control_server.hpp`. One
+page, no build step, no external requests (everything it does is a
+`fetch()` back to this same server): a row per window (host included),
+each with a mode dropdown, a color dropdown, and a Close button (the
+host's row says "Quit All" instead, since closing window 0 *is* closing
+the host -- same cascade as `q`), plus a "+ Spawn Window" button. It
+polls `GET /api/state` once a second and just re-renders; every action
+(`POST /api/spawn`, `/api/close`, `/api/mode`, `/api/color`, the latter
+three taking a small JSON body keyed by the window's *display* number,
+never its real pid) fires and waits for the next poll to confirm it,
+rather than updating optimistically itself -- simple, at the cost of up
+to ~1s before a change is visibly confirmed in the browser.
+
+Only the host runs this -- it's the only process with a view of every
+window, so it's the natural single control point (same reasoning as `n`
+already being relayed to the host from a child, see above). Controlling
+a *child's* mode/color is just the host sending it the new
+`ipc::SetModeMessage`/`ipc::SetColorMessage`; controlling the host's own
+is the same request touching this process's own `GlobalConfig`/mode
+variable directly. Both color-carrying renderers
+(`CheckerboardRenderer`/`MatrixRainRenderer`) only ever read
+`GlobalConfig::baseColor` once, in their constructor -- so applying a
+live color change means explicitly re-running their `setupColors()`
+(now public for exactly this) rather than just mutating the config and
+expecting it to show up. That re-run has to happen on the thread that
+owns the ncurses session, never a background reader thread (same rule as
+every other ncurses call in this codebase), which is why both host.cpp's
+main loop and subordinate.cpp's diff a locally-tracked "last applied"
+snapshot once a frame rather than acting the moment the message arrives.
+
+Mode is simpler -- `draw()` already reads the current mode fresh every
+frame -- but a window's mode can *also* change locally (the arrow keys
+still work), and the host has no way to know that happened unless the
+window tells it. Rather than have two senders touch the same child
+connection (the reader thread confirming a remote command, the main
+loop reporting a local key press -- a real risk of interleaving two
+messages' bytes on the wire, since `UnixSocketConnection::send()` isn't
+internally synchronized), only the main loop ever sends: every frame it
+diffs the window's actual current mode/color against what it last told
+the host, and sends `ipc::StateMessage` exactly when that diff is
+non-empty. This one mechanism covers "arrow key changed it" and "a
+remote command changed it" and "just connected, host doesn't know my
+starting state yet" (the diff's initial state is deliberately
+unmatchable) without three separate code paths.
+
+`ControlServer` (`control_server.hpp`/`.cpp`) is a from-scratch,
+deliberately minimal HTTP/1.1 server -- 127.0.0.1-only, one thread per
+connection, no keep-alive, no chunked encoding -- in the same spirit as
+`UnixSocketConnection`'s hand-rolled framing (see its doc comment): a
+browser-compatible transport instead of the length-prefixed JSON one
+everything else speaks, but built the same way rather than reaching for
+a dependency.
 
 ## A real ncurses rendering bug
 
@@ -431,6 +493,9 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   and its tiny message schema.
 - `window_launcher.cpp`: `AppleScriptWindowLauncher`, spawning/closing
   Terminal.app windows, plus `currentExecutablePath()`.
+- `control_server.cpp`: `ControlServer`, the host's embedded web control
+  panel -- a from-scratch HTTP/1.1 server plus the single HTML/CSS/JS page
+  it serves. See **Web control panel** above.
 - `controller.cpp` / `subordinate.cpp`: the explicit orchestration mode
   (see **Multi-window** above) -- `runSubordinate` is also what a
   discovered child runs, just with different args.
@@ -475,6 +540,15 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   audio failing to start no longer hard-fails the process (bars mode
   used to) -- it just prints a warning and bars mode shows as an empty
   baseline until/unless audio becomes available.
+- The web control panel (see **Web control panel** above) has no
+  authentication at all -- fine since it's bound to 127.0.0.1 only, but
+  that means any other local process/user on the same machine can hit
+  it too, not just a browser you opened yourself. It's also host/child-
+  only: the explicit `--controller` mode doesn't run one, and a
+  subordinate that isn't a host/child doesn't listen for
+  `set_mode`/`set_color` either (only `runSubordinate`'s reader thread,
+  shared by both paths, does -- but nothing on the `--controller` side
+  ever sends them).
 - The rotation timer, beat-detection constants, and Matrix rain tuning
   constants are all separate named constants with no shared config file
   or CLI overrides yet -- fine for now, but worth consolidating if there

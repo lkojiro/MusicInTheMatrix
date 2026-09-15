@@ -37,6 +37,8 @@ AppArgs parseArgs(int argc, char** argv) {
                 args.colorName = value;
             } else if (key == "spawn-token") {
                 args.spawnToken = value;
+            } else if (key == "web-port") {
+                args.webPort = std::stoi(value);
             }
             continue;
         }

@@ -39,6 +39,16 @@ public:
     // no audio is available).
     void draw(float loudness, bool beatPulse);
 
+    // Re-reads GlobalConfig::baseColor and redefines this renderer's
+    // color pairs from it -- init_pair() can be called again at any time
+    // to redefine an existing pair, so this is safe to call again after
+    // construction, not just from it. Used to apply a live color change
+    // from control_server.hpp's web UI. Must be called from the same
+    // thread that owns the ncurses session (the main render loop) --
+    // never from a background reader thread, same rule as every other
+    // ncurses call in this codebase.
+    void setupColors();
+
 private:
     struct Drop {
         int x = 0;
@@ -54,7 +64,6 @@ private:
     void spawnBeatBurst();
     void triggerBeatPulse(float loudness);
     char randomChar();
-    void setupColors();
     int colorPairForLevel(int level) const;
 
     int width_ = 0;

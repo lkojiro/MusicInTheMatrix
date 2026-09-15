@@ -14,6 +14,7 @@
 #include "mitm/beat_detector.hpp"
 #include "mitm/checkerboard_renderer.hpp"
 #include "mitm/color_scheme.hpp"
+#include "mitm/control_server.hpp"
 #include "mitm/curses_util.hpp"
 #include "mitm/fft_processor.hpp"
 #include "mitm/global_config.hpp"
@@ -40,7 +41,47 @@ void handleSigint(int /*signal*/) {
 struct Child {
     long windowHandle = -1; // -1 unless spawn-token-correlated (see below)
     std::unique_ptr<UnixSocketConnection> connection;
+    // The host's best current knowledge of this child's own mode/color,
+    // for the control server's dashboard (see control_server.hpp).
+    // Starts as "unknown" (empty) until its first ipc::StateMessage
+    // arrives, normally within moments of hello -- see the accept
+    // thread's per-connection reader below.
+    std::string mode;
+    std::string colorName;
 };
+
+// Waits (bounded) for every id in `ids` to disappear from `children`
+// (indicating its process actually finished disconnecting -- see the
+// "closing a window with a live process" gotcha in the README), then
+// closes whichever of them we have an AppleScript handle for. Shared by
+// full-host-shutdown (closing every child) and the control server's
+// single-window close (see control_server.hpp) so both get the same
+// wait-then-grace-delay-then-close ordering rather than two copies of
+// it drifting apart. Runs synchronously in whatever thread calls it --
+// callers that shouldn't block (an HTTP request handler, in particular)
+// should run this in their own detached thread instead.
+void waitAndCloseWindows(std::mutex& childrenMutex, std::unordered_map<int, Child>& children,
+                          AppleScriptWindowLauncher& launcher, const std::vector<int>& ids,
+                          const std::vector<long>& handlesToClose) {
+    constexpr auto kShutdownWaitTimeout = std::chrono::seconds(3);
+    constexpr auto kPostDisconnectGrace = std::chrono::milliseconds(400);
+    auto waitStart = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - waitStart < kShutdownWaitTimeout) {
+        bool allGone;
+        {
+            std::lock_guard<std::mutex> lock(childrenMutex);
+            allGone = std::none_of(ids.begin(), ids.end(), [&](int id) { return children.count(id) != 0; });
+        }
+        if (allGone) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!handlesToClose.empty()) {
+        std::this_thread::sleep_for(kPostDisconnectGrace);
+    }
+    for (long handle : handlesToClose) {
+        launcher.close(handle);
+    }
+}
 
 // Sends every connected child the host's current view of the window set,
 // and updates the host's own GlobalConfig the same way. Caller must
@@ -233,12 +274,24 @@ int runHost(const AppArgs& args) {
             std::thread([&childrenMutex, &children, &windowOrder, &spawnChild, ownId, id, connPtr] {
                 nlohmann::json msg;
                 while (connPtr->receive(msg)) {
-                    if (ipc::messageType(msg) == "spawn_request") {
+                    std::string type = ipc::messageType(msg);
+                    if (type == "spawn_request") {
                         // A child's 'n' -- spawn it a sibling, same as if
-                        // this host's own 'n' had been pressed. Nothing
-                        // else to act on besides that and noticing
-                        // disconnect below.
+                        // this host's own 'n' had been pressed.
                         spawnChild();
+                    } else if (type == "state") {
+                        // This child's current mode/color, for the
+                        // control server's dashboard (see
+                        // control_server.hpp) -- sent right after hello
+                        // and again whenever either actually changes, so
+                        // this stays accurate even when it changed
+                        // locally (arrow keys), not through the web UI.
+                        std::lock_guard<std::mutex> lock(childrenMutex);
+                        auto it = children.find(id);
+                        if (it != children.end()) {
+                            it->second.mode = msg.value("mode", std::string());
+                            it->second.colorName = msg.value("color_name", std::string());
+                        }
                     }
                 }
                 std::lock_guard<std::mutex> lock(childrenMutex);
@@ -271,7 +324,153 @@ int runHost(const AppArgs& args) {
     MatrixRainRenderer matrixRenderer;
     CheckerboardRenderer checkerboardRenderer;
 
-    VisualMode mode = parseVisualMode(args.visualMode);
+    // Atomic (not a plain local) because the control server's HTTP
+    // handler thread below also writes it, controlling the host's own
+    // window the same way a remote SetModeMessage controls a child's --
+    // see control_server.hpp.
+    std::atomic<VisualMode> mode{parseVisualMode(args.visualMode)};
+
+    // The host's own color *name* -- GlobalConfig only carries the
+    // parsed BaseColor, not the string the control server's dashboard
+    // wants to display/round-trip in a <select>. Lives under
+    // childrenMutex alongside windowOrder/children (not its own mutex),
+    // since the dashboard reads all of it together as one snapshot.
+    std::string hostColorName = args.colorName;
+    // What color this process last actually applied to
+    // matrixRenderer/checkerboardRenderer -- compared against
+    // GlobalConfig::baseColor once a frame below so a control-server-
+    // driven color change (which can only safely touch GlobalConfig,
+    // not ncurses, from that request-handling thread) gets picked up
+    // and applied on the main thread, which owns the ncurses session.
+    BaseColor lastAppliedColor = parseColorName(args.colorName);
+
+    // Sends `id` a shutdown message and closes its window once it
+    // actually disconnects, without blocking the caller -- see
+    // waitAndCloseWindows() above. Used by the control server's
+    // per-window close (see control_server.hpp); the host's own full
+    // shutdown (closing every child at once) still does this inline
+    // near the bottom of this function since it can afford to block --
+    // the process is exiting right after either way.
+    auto closeChildAsync = [&](int id) {
+        long handle = -1;
+        {
+            std::lock_guard<std::mutex> lock(childrenMutex);
+            auto it = children.find(id);
+            if (it == children.end()) return;
+            if (it->second.connection) it->second.connection->send(ipc::toJson(ipc::ShutdownMessage{}));
+            handle = it->second.windowHandle;
+        }
+        std::vector<long> handles;
+        if (handle >= 0) handles.push_back(handle);
+        std::thread([&childrenMutex, &children, &launcher, id, handles] {
+            waitAndCloseWindows(childrenMutex, children, launcher, {id}, handles);
+        }).detach();
+    };
+
+    // The web control panel -- see control_server.hpp for the transport
+    // and the embedded page itself. Every route below runs on whichever
+    // per-connection thread ControlServer handed the request to, so
+    // anything touching children/windowOrder/hostColorName takes
+    // childrenMutex, same as every other thread that touches them.
+    ControlServer webServer(args.webPort, [&](const HttpRequest& req) -> HttpResponse {
+        if (req.method == "GET" && req.path == "/api/state") {
+            nlohmann::json windows = nlohmann::json::array();
+            {
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                for (size_t i = 0; i < windowOrder.size(); ++i) {
+                    int id = windowOrder[i];
+                    nlohmann::json w;
+                    w["displayNumber"] = static_cast<int>(i);
+                    if (id == ownId) {
+                        w["isHost"] = true;
+                        w["mode"] = visualModeName(mode.load());
+                        w["colorName"] = hostColorName;
+                    } else {
+                        w["isHost"] = false;
+                        auto it = children.find(id);
+                        w["mode"] = it != children.end() ? it->second.mode : "";
+                        w["colorName"] = it != children.end() ? it->second.colorName : "";
+                    }
+                    windows.push_back(w);
+                }
+            }
+            nlohmann::json result;
+            result["windows"] = windows;
+            return HttpResponse{200, "application/json", result.dump()};
+        }
+
+        if (req.method == "POST" && req.path == "/api/spawn") {
+            spawnChild(); // blocks ~0.3-1s (AppleScript) -- fine for a button click
+            return HttpResponse{200, "application/json", "{\"ok\":true}"};
+        }
+
+        // Every remaining route needs a JSON body with at least an
+        // integer "id" (a *display* number, e.g. what the web UI shows
+        // and what windowOrder indexes by -- not the real pid/handle
+        // underneath it, which the browser never sees).
+        nlohmann::json body = nlohmann::json::parse(req.body, /*cb=*/nullptr, /*allow_exceptions=*/false);
+        if (body.is_discarded() || !body.contains("id") || !body["id"].is_number_integer()) {
+            return HttpResponse{400, "application/json", "{\"ok\":false,\"error\":\"missing id\"}"};
+        }
+        int displayNumber = body["id"].get<int>();
+        int realId = -1;
+        {
+            std::lock_guard<std::mutex> lock(childrenMutex);
+            if (displayNumber >= 0 && static_cast<size_t>(displayNumber) < windowOrder.size()) {
+                realId = windowOrder[static_cast<size_t>(displayNumber)];
+            }
+        }
+        if (realId < 0) {
+            return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such window\"}"};
+        }
+
+        if (req.method == "POST" && req.path == "/api/close") {
+            if (realId == ownId) {
+                // Closing "window 0" means closing the host -- which
+                // cascades to every child anyway (see the shutdown code
+                // below), so that's exactly what quitting via 'q' does.
+                g_stopRequested = true;
+            } else {
+                closeChildAsync(realId);
+            }
+            return HttpResponse{200, "application/json", "{\"ok\":true}"};
+        }
+
+        if (req.method == "POST" && req.path == "/api/mode") {
+            std::string modeName = body.value("mode", std::string("bars"));
+            if (realId == ownId) {
+                mode = parseVisualMode(modeName);
+            } else {
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                auto it = children.find(realId);
+                if (it != children.end() && it->second.connection) {
+                    it->second.connection->send(ipc::toJson(ipc::SetModeMessage{modeName}));
+                    it->second.mode = modeName; // optimistic -- the child's own state echo will confirm
+                }
+            }
+            return HttpResponse{200, "application/json", "{\"ok\":true}"};
+        }
+
+        if (req.method == "POST" && req.path == "/api/color") {
+            std::string colorName = body.value("color", std::string("green"));
+            if (realId == ownId) {
+                updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(colorName); });
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                hostColorName = colorName;
+            } else {
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                auto it = children.find(realId);
+                if (it != children.end() && it->second.connection) {
+                    it->second.connection->send(ipc::toJson(ipc::SetColorMessage{colorName}));
+                    it->second.colorName = colorName; // optimistic, as above
+                }
+            }
+            return HttpResponse{200, "application/json", "{\"ok\":true}"};
+        }
+
+        return HttpResponse{404, "application/json", "{\"ok\":false,\"error\":\"no such route\"}"};
+    });
+    std::printf("Host: control panel at http://127.0.0.1:%d\n", args.webPort);
 
     std::vector<float> samples;
     std::vector<float> buckets;
@@ -282,10 +481,10 @@ int runHost(const AppArgs& args) {
                 g_stopRequested = true;
                 break;
             case curses_util::InputAction::NextMode:
-                mode = nextVisualMode(mode);
+                mode = nextVisualMode(mode.load());
                 break;
             case curses_util::InputAction::PrevMode:
-                mode = prevVisualMode(mode);
+                mode = prevVisualMode(mode.load());
                 break;
             case curses_util::InputAction::SpawnWindow:
                 // Blocks for ~0.3-1s (AppleScript/Terminal overhead) --
@@ -297,6 +496,17 @@ int runHost(const AppArgs& args) {
                 break;
         }
         if (g_stopRequested.load()) break;
+
+        // Pick up a color change made via the control server -- it can
+        // only safely touch GlobalConfig from its own thread, not
+        // ncurses, so applying it (redefining the renderers' color
+        // pairs) happens here instead, once a frame.
+        BaseColor currentColor = getGlobalConfig().baseColor;
+        if (currentColor != lastAppliedColor) {
+            matrixRenderer.setupColors();
+            checkerboardRenderer.setupColors();
+            lastAppliedColor = currentColor;
+        }
 
         // The host always renders -- every window (host and every
         // connected child) shows live visuals simultaneously, no rotation.
@@ -310,7 +520,7 @@ int runHost(const AppArgs& args) {
             beatDetected = features.beatDetected;
         }
 
-        switch (mode) {
+        switch (mode.load()) {
             case VisualMode::Bars:
                 barsRenderer.draw(buckets);
                 break;
@@ -329,11 +539,13 @@ int runHost(const AppArgs& args) {
     if (audioOk) audio.stop();
 
     std::printf("\nHost: shutting down, closing child windows...\n");
+    std::vector<int> ids;
     std::vector<long> handlesToClose;
     {
         std::lock_guard<std::mutex> lock(childrenMutex);
         for (auto& [id, child] : children) {
             if (child.connection) child.connection->send(ipc::toJson(ipc::ShutdownMessage{}));
+            ids.push_back(id);
             if (child.windowHandle >= 0) handlesToClose.push_back(child.windowHandle);
         }
     }
@@ -348,26 +560,13 @@ int runHost(const AppArgs& args) {
     // in particular) can take a real, non-negligible moment -- long enough
     // to lose the race against this loop's 100ms poll granularity and hit
     // the exact same silent-close failure. Hence the extra flat grace
-    // delay below, on top of waiting for disconnect itself.
-    constexpr auto kShutdownWaitTimeout = std::chrono::seconds(3);
-    constexpr auto kPostDisconnectGrace = std::chrono::milliseconds(400);
-    auto waitStart = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() - waitStart < kShutdownWaitTimeout) {
-        bool allGone;
-        {
-            std::lock_guard<std::mutex> lock(childrenMutex);
-            allGone = children.empty();
-        }
-        if (allGone) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (!handlesToClose.empty()) {
-        std::this_thread::sleep_for(kPostDisconnectGrace);
-    }
-
-    for (long handle : handlesToClose) {
-        launcher.close(handle);
-    }
+    // delay, on top of waiting for disconnect itself -- see
+    // waitAndCloseWindows() above (also used by the control server's
+    // single-window close, so both paths share this exact ordering).
+    // Blocking here (rather than the detached-thread version
+    // closeChildAsync uses) is fine: the process is exiting right after
+    // either way.
+    waitAndCloseWindows(childrenMutex, children, launcher, ids, handlesToClose);
 
     removeHostLockFileIfOwnedBy(ownId);
 

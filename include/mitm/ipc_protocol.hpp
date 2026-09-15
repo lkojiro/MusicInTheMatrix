@@ -76,6 +76,37 @@ struct ConfigMessage {
     std::vector<int> windowIds;
 };
 
+// Host -> subordinate: switch to a different visual mode live. Same
+// names as --visual (bars/matrix/checkerboard); unrecognized names fall
+// back to bars, same as parseVisualMode(). Sent by the control server
+// (see control_server.hpp) in response to a web UI action -- there's no
+// keyboard shortcut for *remotely* changing another window's mode, only
+// your own via the arrow keys.
+struct SetModeMessage {
+    std::string mode;
+};
+
+// Host -> subordinate: switch to a different color live. Same named
+// presets as --color; see color_scheme.hpp. Unlike mode, there's no
+// keyboard shortcut for changing a window's own color at all -- the web
+// UI is the only way to change a running window's color.
+struct SetColorMessage {
+    std::string colorName;
+};
+
+// Subordinate -> host: "here's my current mode and color." Sent once
+// right after hello (so the host's dashboard has an initial value rather
+// than a gap), and again any time either actually changes -- whether
+// that's this window's own arrow keys, or in response to a
+// SetModeMessage/SetColorMessage it just received. A window's mode can
+// change without the host ever telling it to (arrow keys are still
+// local), so the host can't just assume its own last command reflects
+// reality; this is what keeps control_server.hpp's dashboard honest.
+struct StateMessage {
+    std::string mode;
+    std::string colorName;
+};
+
 inline nlohmann::json toJson(const HelloMessage& m) {
     return {{"type", "hello"}, {"id", m.id}, {"pid", m.pid}, {"spawn_token", m.spawnToken}};
 }
@@ -98,6 +129,18 @@ inline nlohmann::json toJson(const SpawnRequestMessage&) {
 
 inline nlohmann::json toJson(const ConfigMessage& m) {
     return {{"type", "config"}, {"window_count", m.windowCount}, {"window_ids", m.windowIds}};
+}
+
+inline nlohmann::json toJson(const SetModeMessage& m) {
+    return {{"type", "set_mode"}, {"mode", m.mode}};
+}
+
+inline nlohmann::json toJson(const SetColorMessage& m) {
+    return {{"type", "set_color"}, {"color_name", m.colorName}};
+}
+
+inline nlohmann::json toJson(const StateMessage& m) {
+    return {{"type", "state"}, {"mode", m.mode}, {"color_name", m.colorName}};
 }
 
 // Returns the "type" field, or an empty string if the message is malformed.

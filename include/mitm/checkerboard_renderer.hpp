@@ -33,6 +33,16 @@ public:
     // FadeStyle it was randomly assigned when lit.
     void draw(float loudness, bool beatPulse);
 
+    // Re-reads GlobalConfig::baseColor and redefines this renderer's
+    // color pairs from it -- init_pair() can be called again at any time
+    // to redefine an existing pair, so this is safe to call again after
+    // construction, not just from it. Used to apply a live color change
+    // from control_server.hpp's web UI. Must be called from the same
+    // thread that owns the ncurses session (the main render loop) --
+    // never from a background reader thread, same rule as every other
+    // ncurses call in this codebase.
+    void setupColors();
+
 private:
     // How a lit cell fades back to black, chosen randomly each time a
     // cell is lit (see randomFadeStyle()):
@@ -61,7 +71,6 @@ private:
         bool alive = false;          // false once fully faded -- renders as off
     };
 
-    void setupColors();
     int colorPairForIntensity(float intensity) const;
     void lightCellsForBeat(float loudness);
     void lightFullCheckerboardPattern();

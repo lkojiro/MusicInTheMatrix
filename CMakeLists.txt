@@ -42,6 +42,7 @@ add_executable(mitm
     src/global_config.cpp
     src/unix_socket.cpp
     src/window_launcher.cpp
+    src/control_server.cpp
 )
 target_include_directories(mitm PRIVATE
     include

@@ -58,6 +58,10 @@ struct AppArgs {
     // an existing window -- see HelloMessage's doc comment in
     // ipc_protocol.hpp for what it's for.
     std::string spawnToken;
+    // Only meaningful for the host: the port its web control panel
+    // listens on (127.0.0.1 only -- see control_server.hpp). Override
+    // with --web-port=N if that port's already taken.
+    int webPort = 7887;
 };
 
 AppArgs parseArgs(int argc, char** argv);

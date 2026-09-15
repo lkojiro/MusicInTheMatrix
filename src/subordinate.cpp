@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -24,13 +25,35 @@ namespace mitm {
 
 namespace {
 
+// Everything the background reader thread might need to update in
+// response to a message from the host/controller, or that the main
+// render loop needs to read back (including to notice a *local* change,
+// like an arrow-key mode switch, that the reader thread never touched).
+// Bundled into one struct rather than a growing list of individual
+// out-params -- see connectAndHandshake() and runSubordinate() below.
+//
+// mode/colorName deliberately don't get pushed to the host by whichever
+// side changes them (the reader thread, on set_mode/set_color; the main
+// loop, on an arrow key) -- see runSubordinate()'s per-frame diff
+// against lastReportedMode/lastReportedColorName for why: it's what lets
+// this window's `conn` stay single-writer (only the main thread ever
+// calls conn->send()), rather than needing a send-side mutex to protect
+// against the reader thread and main thread writing to the same socket
+// at the same time.
+struct SharedState {
+    std::atomic<bool> active{false};
+    std::atomic<bool> shutdownRequested{false};
+    std::atomic<int> displayNumber{-1}; // -1 until the first ConfigMessage arrives
+    std::atomic<VisualMode> mode{VisualMode::Bars};
+    std::mutex colorNameMutex; // guards colorName (not atomic-friendly)
+    std::string colorName;
+};
+
 // Connects to the controller, sends hello, and spins up a background
-// reader thread that keeps `active`/`shutdownRequested` up to date.
-// Returns nullptr (having already printed an error) on failure.
+// reader thread that keeps `state` up to date. Returns nullptr (having
+// already printed an error) on failure.
 std::unique_ptr<UnixSocketConnection> connectAndHandshake(const AppArgs& args, std::thread& readerOut,
-                                                           std::atomic<bool>& active,
-                                                           std::atomic<bool>& shutdownRequested,
-                                                           std::atomic<int>& displayNumber) {
+                                                           SharedState& state) {
     std::string connectError;
     auto conn = connectUnixSocket(args.socketPath, connectError);
     if (!conn) {
@@ -46,12 +69,12 @@ std::unique_ptr<UnixSocketConnection> connectAndHandshake(const AppArgs& args, s
 
     UnixSocketConnection* connPtr = conn.get();
     int myId = args.id;
-    readerOut = std::thread([connPtr, &active, &shutdownRequested, &displayNumber, myId] {
+    readerOut = std::thread([connPtr, &state, myId] {
         nlohmann::json msg;
         while (connPtr->receive(msg)) {
             std::string type = ipc::messageType(msg);
             if (type == "activate") {
-                active = msg.value("active", false);
+                state.active = msg.value("active", false);
             } else if (type == "config") {
                 // Kept in sync with the host/controller's view of the
                 // whole window set.
@@ -74,18 +97,33 @@ std::unique_ptr<UnixSocketConnection> connectAndHandshake(const AppArgs& args, s
                 // lower-numbered sibling disconnected).
                 for (size_t i = 0; i < windowIds.size(); ++i) {
                     if (windowIds[i].get<int>() == myId) {
-                        displayNumber = static_cast<int>(i);
+                        state.displayNumber = static_cast<int>(i);
                         curses_util::setWindowTitle("mitm — CHILD (" + std::to_string(i) + ")");
                         break;
                     }
                 }
+            } else if (type == "set_mode") {
+                // Just updates shared state -- the main loop's draw()
+                // dispatch already reads state.mode fresh every frame, so
+                // this takes effect immediately without this thread
+                // touching ncurses (never safe off the main thread) or
+                // conn (see SharedState's doc comment).
+                state.mode = parseVisualMode(msg.value("mode", std::string("bars")));
+            } else if (type == "set_color") {
+                std::string newColor = msg.value("color_name", std::string("green"));
+                updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(newColor); });
+                std::lock_guard<std::mutex> lock(state.colorNameMutex);
+                state.colorName = newColor;
+                // Actually applying this (re-running the renderers'
+                // setupColors()) has to happen on the main thread -- see
+                // runSubordinate()'s per-frame diff check.
             } else if (type == "shutdown") {
                 break;
             }
         }
         // Either an explicit shutdown, or the connection dropped (e.g. the
         // controller process died) -- either way, this window should stop.
-        shutdownRequested = true;
+        state.shutdownRequested = true;
     });
 
     return conn;
@@ -102,12 +140,12 @@ int runSubordinate(const AppArgs& args) {
     // connecting.
     curses_util::setWindowTitle("mitm — CHILD (connecting...)");
 
-    std::atomic<bool> active{false};
-    std::atomic<bool> shutdownRequested{false};
-    std::atomic<int> displayNumber{-1}; // -1 until the first ConfigMessage arrives
+    SharedState state;
+    state.mode = parseVisualMode(args.visualMode);
+    state.colorName = args.colorName;
     std::thread reader;
 
-    auto conn = connectAndHandshake(args, reader, active, shutdownRequested, displayNumber);
+    auto conn = connectAndHandshake(args, reader, state);
     if (!conn) return 1;
 
     // Populated before any renderer is constructed (they read baseColor in
@@ -143,21 +181,27 @@ int runSubordinate(const AppArgs& args) {
     MatrixRainRenderer matrixRenderer;
     CheckerboardRenderer checkerboardRenderer;
 
-    VisualMode mode = parseVisualMode(args.visualMode);
-
     std::vector<float> samples;
     std::vector<float> buckets;
 
-    while (!shutdownRequested.load()) {
+    // What the host last heard from us, for the per-frame diff check
+    // below. lastReportedColorName starts empty (never a real preset
+    // name) so that check fires on the very first frame, reporting our
+    // actual starting mode/color without needing separate "send once at
+    // startup" code -- it just falls out of the general diff.
+    VisualMode lastReportedMode = state.mode.load();
+    std::string lastReportedColorName;
+
+    while (!state.shutdownRequested.load()) {
         switch (curses_util::pollInput()) {
             case curses_util::InputAction::Quit:
-                shutdownRequested = true;
+                state.shutdownRequested = true;
                 break;
             case curses_util::InputAction::NextMode:
-                mode = nextVisualMode(mode);
+                state.mode = nextVisualMode(state.mode.load());
                 break;
             case curses_util::InputAction::PrevMode:
-                mode = prevVisualMode(mode);
+                state.mode = prevVisualMode(state.mode.load());
                 break;
             case curses_util::InputAction::SpawnWindow:
                 // We don't have our own WindowLauncher (or, in the
@@ -175,9 +219,35 @@ int runSubordinate(const AppArgs& args) {
             case curses_util::InputAction::None:
                 break;
         }
-        if (shutdownRequested.load()) break;
+        if (state.shutdownRequested.load()) break;
 
-        if (active.load()) {
+        // Report our mode/color to the host whenever either actually
+        // changed since we last told it -- covers both an arrow key just
+        // above and a set_mode/set_color the reader thread applied to
+        // `state` since the last frame (see SharedState's doc comment
+        // for why this, and not a send from the reader thread itself, is
+        // what keeps `conn` single-writer). A color change also needs
+        // the color-carrying renderers' pairs actually redefined --
+        // ncurses calls have to happen on this thread, never the reader
+        // thread, which is the other reason this can't just happen where
+        // set_color was received.
+        VisualMode currentMode = state.mode.load();
+        std::string currentColorName;
+        {
+            std::lock_guard<std::mutex> lock(state.colorNameMutex);
+            currentColorName = state.colorName;
+        }
+        if (currentMode != lastReportedMode || currentColorName != lastReportedColorName) {
+            if (currentColorName != lastReportedColorName) {
+                matrixRenderer.setupColors();
+                checkerboardRenderer.setupColors();
+            }
+            conn->send(ipc::toJson(ipc::StateMessage{visualModeName(currentMode), currentColorName}));
+            lastReportedMode = currentMode;
+            lastReportedColorName = currentColorName;
+        }
+
+        if (state.active.load()) {
             float loudness = 0.0f;
             bool beatDetected = false;
             if (audioOk) {
@@ -188,7 +258,7 @@ int runSubordinate(const AppArgs& args) {
                 beatDetected = features.beatDetected;
             }
 
-            switch (mode) {
+            switch (currentMode) {
                 case VisualMode::Bars:
                     barsRenderer.draw(buckets);
                     break;
@@ -200,7 +270,7 @@ int runSubordinate(const AppArgs& args) {
                     break;
             }
         } else {
-            int shownNumber = displayNumber.load();
+            int shownNumber = state.displayNumber.load();
             std::string idleLabel = shownNumber >= 0
                                          ? "window " + std::to_string(shownNumber) + " -- waiting to go live"
                                          : "connecting -- waiting to go live";
