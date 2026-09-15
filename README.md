@@ -1,0 +1,1 @@
+Terminal based music visualizer
