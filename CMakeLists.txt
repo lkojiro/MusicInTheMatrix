@@ -36,6 +36,8 @@ add_executable(mitm
     src/terminal_renderer.cpp
     src/matrix_rain_renderer.cpp
     src/checkerboard_renderer.cpp
+    src/oscilloscope_renderer.cpp
+    src/band_meter_renderer.cpp
     src/beat_detector.cpp
     src/curses_util.cpp
     src/color_scheme.cpp

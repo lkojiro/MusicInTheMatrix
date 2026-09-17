@@ -30,6 +30,26 @@ std::vector<std::pair<size_t, size_t>> computeLogBuckets(size_t numBins, size_t 
     return ranges;
 }
 
+// Most real audio (music especially) carries far more raw energy at low
+// frequencies than high -- both because that's how natural/musical
+// spectra actually tilt, and because equal-loudness perception falls off
+// at the high end -- so raw FFT magnitude alone makes the bass buckets
+// read as almost always maxed out while the treble buckets barely
+// register anything, regardless of how "loud" that treble content
+// actually sounds. This multiplies each bucket by a gain that grows
+// exponentially with frequency (1x at the lowest bucket, up to
+// kHighFrequencyBoost at the highest) to counteract that tilt, so a
+// bucket's displayed level reflects how much it stands out *within its
+// own part of the spectrum* rather than being dominated by the bass end
+// no matter what.
+constexpr float kHighFrequencyBoost = 20.0f;
+
+float highFrequencyGain(size_t bucket, size_t bucketCount) {
+    if (bucketCount <= 1) return 1.0f;
+    float t = static_cast<float>(bucket) / static_cast<float>(bucketCount - 1); // 0 at lowest, 1 at highest
+    return std::pow(kHighFrequencyBoost, t);
+}
+
 } // namespace
 
 FftProcessor::FftProcessor(int sampleRate, size_t windowSize, size_t bucketCount)
@@ -89,8 +109,22 @@ void FftProcessor::process(const std::vector<float>& samples, std::vector<float>
         // input amplitude. This divisor was picked empirically so typical
         // mic/music input lands roughly in [0, 1] -- tune to taste, or make
         // this adaptive (e.g. running max) once the MVP is working.
-        buckets[b] = avgMag / (static_cast<float>(windowSize_) * 0.05f);
+        float normalized = avgMag / (static_cast<float>(windowSize_) * 0.05f);
+
+        // See highFrequencyGain()'s own comment -- counteracts low
+        // buckets otherwise dominating purely because bass carries more
+        // raw energy, not because it's actually "louder" in context.
+        buckets[b] = normalized * highFrequencyGain(b, bucketCount_);
     }
+}
+
+std::pair<float, float> bucketFrequencyRange(int sampleRate, size_t windowSize, size_t bucketCount,
+                                              size_t bucket) {
+    size_t numBins = windowSize / 2 + 1;
+    std::vector<std::pair<size_t, size_t>> ranges = computeLogBuckets(numBins, bucketCount);
+    auto [startBin, endBin] = ranges.at(bucket);
+    float hzPerBin = static_cast<float>(sampleRate) / static_cast<float>(windowSize);
+    return {static_cast<float>(startBin) * hzPerBin, static_cast<float>(endBin) * hzPerBin};
 }
 
 } // namespace mitm

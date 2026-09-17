@@ -9,6 +9,12 @@ namespace mitm {
 // pipeline (the host) and handed to every registered AudioEventSink.
 struct AudioFrame {
     std::vector<float> buckets; // FFT magnitudes, config::kBucketCount entries
+    // Raw time-domain waveform, downsampled to config::kWaveformPointCount
+    // entries, values roughly in [-1, 1], earliest sample first -- for
+    // OscilloscopeRenderer. Everything else here is frequency-domain
+    // (buckets) or a single scalar (loudness/beatDetected); this is the
+    // one field a sink reads if it wants the actual wave shape.
+    std::vector<float> waveform;
     float loudness = 0.0f;
     bool beatDetected = false;
 };

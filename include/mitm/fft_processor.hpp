@@ -14,6 +14,14 @@ namespace mitm {
 // hold almost all the visible energy in most music and the rest would sit
 // flat, since human hearing (and most musical content) is logarithmic in
 // pitch.
+//
+// Bucket magnitudes also get an exponential gain boost that grows with
+// frequency (see highFrequencyGain() in the .cpp) -- most audio carries
+// far more raw energy at the low end than the high end (both how music
+// actually tilts and how equal-loudness perception falls off at high
+// frequencies), so without this, bass buckets read as almost always
+// maxed out while treble buckets barely register at all, regardless of
+// how loud that treble content actually sounds in context.
 class FftProcessor {
 public:
     // windowSize must be even (kiss_fftr's requirement); powers of two are
@@ -47,5 +55,19 @@ private:
     // Precomputed [start, end) FFT-bin ranges for each log-spaced bucket.
     std::vector<std::pair<size_t, size_t>> bucketBinRanges_;
 };
+
+// The [startHz, endHz) frequency range log-spaced bucket `bucket` (of
+// `bucketCount` total, over an FFT of the given windowSize/sampleRate)
+// covers -- the same log-spacing math process() uses internally to build
+// its own bucket-to-bin ranges (see computeLogBuckets() in the .cpp),
+// exposed as a free function so a caller that only has the resulting
+// bucket *values* -- e.g. a renderer running in a subordinate process,
+// which no longer owns a live FftProcessor of its own (see
+// AudioEventSink) -- can still work out which frequency range a given
+// bucket index covers, without duplicating the log-spacing formula or
+// needing a real FftProcessor instance (which would mean allocating a
+// KissFFT config just to ask this).
+std::pair<float, float> bucketFrequencyRange(int sampleRate, size_t windowSize, size_t bucketCount,
+                                              size_t bucket);
 
 } // namespace mitm

@@ -6,6 +6,7 @@
 
 #include <unistd.h> // getpid
 
+#include "mitm/band_meter_renderer.hpp"
 #include "mitm/checkerboard_renderer.hpp"
 #include "mitm/color_scheme.hpp"
 #include "mitm/curses_util.hpp"
@@ -13,6 +14,7 @@
 #include "mitm/ipc_protocol.hpp"
 #include "mitm/matrix_rain_renderer.hpp"
 #include "mitm/modes.hpp"
+#include "mitm/oscilloscope_renderer.hpp"
 #include "mitm/terminal_renderer.hpp"
 #include "mitm/unix_socket.hpp"
 #include "mitm/visual_mode.hpp"
@@ -58,6 +60,7 @@ struct SharedState {
     // a socket instead of within one process.
     std::mutex audioMutex;
     std::vector<float> buckets;
+    std::vector<float> waveform; // guarded by audioMutex, same as buckets -- see OscilloscopeRenderer
     std::atomic<float> loudness{0.0f};
     std::atomic<bool> beatPending{false};
 };
@@ -132,10 +135,14 @@ std::unique_ptr<UnixSocketConnection> connectAndHandshake(const AppArgs& args, s
                 // runSubordinate()'s per-frame diff check.
             } else if (type == "audio_frame") {
                 auto bucketsJson = msg.value("buckets", nlohmann::json::array());
+                auto waveformJson = msg.value("waveform", nlohmann::json::array());
                 std::lock_guard<std::mutex> lock(state.audioMutex);
                 state.buckets.clear();
                 state.buckets.reserve(bucketsJson.size());
                 for (auto& v : bucketsJson) state.buckets.push_back(v.get<float>());
+                state.waveform.clear();
+                state.waveform.reserve(waveformJson.size());
+                for (auto& v : waveformJson) state.waveform.push_back(v.get<float>());
                 state.loudness = msg.value("loudness", 0.0f);
                 if (msg.value("beat_detected", false)) state.beatPending = true;
             } else if (type == "shutdown") {
@@ -185,6 +192,8 @@ int runSubordinate(const AppArgs& args) {
     TerminalRenderer barsRenderer;
     MatrixRainRenderer matrixRenderer;
     CheckerboardRenderer checkerboardRenderer;
+    OscilloscopeRenderer oscilloscopeRenderer;
+    BandMeterRenderer bandMeterRenderer;
 
     // What the host last heard from us, for the per-frame diff check
     // below. lastReportedColorName starts empty (never a real preset
@@ -193,6 +202,20 @@ int runSubordinate(const AppArgs& args) {
     // startup" code -- it just falls out of the general diff.
     VisualMode lastReportedMode = state.mode.load();
     std::string lastReportedColorName;
+
+    // Whether the *previous* iteration's draw call was
+    // bandMeterRenderer's -- BandMeterRenderer keeps its box borders on
+    // screen across draw() calls rather than redrawing them every frame
+    // (see its class doc comment), an optimization that breaks the
+    // moment something else fully repaints the screen in between (any
+    // other mode's renderer, or the idle screen below) while the
+    // terminal's size stays the same, since that's the only signal it
+    // otherwise uses to decide whether to rebuild. This flag is what
+    // lets it tell the difference: false on any frame immediately after
+    // switching into BandMeters means "the screen might not be mine
+    // anymore," so invalidate() forces a full rebuild before that
+    // frame's draw().
+    bool lastDrawWasBandMeters = false;
 
     while (!state.shutdownRequested.load()) {
         curses_util::InputAction action = curses_util::pollInput();
@@ -208,6 +231,20 @@ int runSubordinate(const AppArgs& args) {
                 break;
             case curses_util::InputAction::NextColor:
             case curses_util::InputAction::PrevColor: {
+                if (state.mode.load() == VisualMode::BandMeters) {
+                    // BandMeterRenderer ignores GlobalConfig::baseColor
+                    // entirely (see its own class doc comment) -- up/down
+                    // cycles its fixed color scheme instead of picking a
+                    // single hue, the one thing about its colors that is
+                    // switchable.
+                    if (action == curses_util::InputAction::NextColor) {
+                        bandMeterRenderer.nextScheme();
+                    } else {
+                        bandMeterRenderer.prevScheme();
+                    }
+                    bandMeterRenderer.setupColors();
+                    break;
+                }
                 // Same "local change" handling as the reader thread's
                 // set_color case below (updateGlobalConfig() *and*
                 // state.colorName, since setupColors() -- called from the
@@ -264,6 +301,8 @@ int runSubordinate(const AppArgs& args) {
                 barsRenderer.setupColors();
                 matrixRenderer.setupColors();
                 checkerboardRenderer.setupColors();
+                oscilloscopeRenderer.setupColors();
+                bandMeterRenderer.setupColors();
             }
             conn->send(ipc::toJson(ipc::StateMessage{visualModeName(currentMode), currentColorName}));
             lastReportedMode = currentMode;
@@ -278,9 +317,11 @@ int runSubordinate(const AppArgs& args) {
             // exactly once, regardless of how this loop's cadence lines
             // up with the host's send cadence.
             std::vector<float> buckets;
+            std::vector<float> waveform;
             {
                 std::lock_guard<std::mutex> lock(state.audioMutex);
                 buckets = state.buckets;
+                waveform = state.waveform;
             }
             float loudness = state.loudness.load();
             bool beatDetected = state.beatPending.exchange(false);
@@ -288,18 +329,32 @@ int runSubordinate(const AppArgs& args) {
             switch (currentMode) {
                 case VisualMode::BarsLeft:
                     barsRenderer.draw(buckets, BarLayout::Left);
+                    lastDrawWasBandMeters = false;
                     break;
                 case VisualMode::BarsRight:
                     barsRenderer.draw(buckets, BarLayout::Right);
+                    lastDrawWasBandMeters = false;
                     break;
                 case VisualMode::BarsMiddle:
                     barsRenderer.draw(buckets, BarLayout::Middle);
+                    lastDrawWasBandMeters = false;
                     break;
                 case VisualMode::Matrix:
                     matrixRenderer.draw(loudness, beatDetected);
+                    lastDrawWasBandMeters = false;
                     break;
                 case VisualMode::Checkerboard:
                     checkerboardRenderer.draw(loudness, beatDetected);
+                    lastDrawWasBandMeters = false;
+                    break;
+                case VisualMode::Oscilloscope:
+                    oscilloscopeRenderer.draw(waveform);
+                    lastDrawWasBandMeters = false;
+                    break;
+                case VisualMode::BandMeters:
+                    if (!lastDrawWasBandMeters) bandMeterRenderer.invalidate();
+                    bandMeterRenderer.draw(buckets);
+                    lastDrawWasBandMeters = true;
                     break;
             }
         } else {
@@ -308,6 +363,7 @@ int runSubordinate(const AppArgs& args) {
                                          ? "window " + std::to_string(shownNumber) + " -- waiting to go live"
                                          : "connecting -- waiting to go live";
             curses_util::drawIdleScreen(idleLabel);
+            lastDrawWasBandMeters = false;
         }
 
         std::this_thread::sleep_for(kFrameInterval);

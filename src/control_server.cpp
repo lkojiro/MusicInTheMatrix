@@ -67,7 +67,7 @@ constexpr const char* kControlPanelHtml = R"HTML(<!doctype html>
 </table>
 <script>
 const COLORS = ["red", "green", "blue", "yellow", "cyan", "magenta", "white"];
-const MODES = ["bars-left", "bars-right", "bars-middle", "matrix", "checkerboard"];
+const MODES = ["bars-left", "bars-right", "bars-middle", "matrix", "checkerboard", "oscilloscope", "bands"];
 const SWATCH_HEX = {
   red: "#f33", green: "#3f3", blue: "#39f", yellow: "#ee3",
   cyan: "#3ee", magenta: "#e3e", white: "#eee"

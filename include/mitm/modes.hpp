@@ -6,7 +6,7 @@ namespace mitm {
 
 // Parsed command-line invocation. Modes share one binary:
 //
-//   mitm [device-name-substring] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard] [--color=NAME]
+//   mitm [device-name-substring] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard|oscilloscope|bands] [--color=NAME]
 //       Default: auto-discovers whether a host is already running (see
 //       host_discovery.hpp) and either becomes the host (runHost) or
 //       connects to the existing one as a child (runSubordinate) -- see
@@ -39,9 +39,11 @@ namespace mitm {
 // mirrors every other bucket outward to both sides at once (see
 // BarLayout in terminal_renderer.hpp for what each one actually draws).
 // --visual=matrix is the Matrix-style digital rain; --visual=checkerboard
-// is the beat-flash grid. This only picks the *starting* mode -- every
-// window can switch live between all five with the left/right arrow keys
-// (see curses_util::InputAction).
+// is the beat-flash grid; --visual=oscilloscope is the time-domain
+// waveform trace (see OscilloscopeRenderer); --visual=bands is the three
+// low/mid/high vertical VU-meter bars (see BandMeterRenderer). This only
+// picks the *starting* mode -- every window can switch live between all
+// seven with the left/right arrow keys (see curses_util::InputAction).
 //
 // --color=NAME (default "green") picks the base hue every renderer's
 // brightness ramp is derived from -- see color_scheme.hpp. One of red,

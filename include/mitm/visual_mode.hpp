@@ -6,20 +6,22 @@ namespace mitm {
 
 // Which visual is currently on screen for a given window. Left/right
 // arrow keys cycle through these live (see curses_util::InputAction);
-// --visual=bars-left|bars-right|bars-middle|matrix|checkerboard only
-// picks the *starting* mode now. The three Bars* modes all draw through
-// TerminalRenderer -- see BarLayout in terminal_renderer.hpp for what
-// each one actually looks like; this enum only decides *which* layout,
-// not how it's drawn.
+// --visual=bars-left|bars-right|bars-middle|matrix|checkerboard|oscilloscope|bands
+// only picks the *starting* mode now. The three Bars* modes all draw
+// through TerminalRenderer -- see BarLayout in terminal_renderer.hpp for
+// what each one actually looks like; this enum only decides *which*
+// layout, not how it's drawn.
 enum class VisualMode {
     BarsLeft,
     BarsRight,
     BarsMiddle,
     Matrix,
     Checkerboard,
+    Oscilloscope,
+    BandMeters,
 };
 
-constexpr int kVisualModeCount = 5;
+constexpr int kVisualModeCount = 7;
 
 inline VisualMode nextVisualMode(VisualMode mode) {
     return static_cast<VisualMode>((static_cast<int>(mode) + 1) % kVisualModeCount);
@@ -39,6 +41,8 @@ inline VisualMode parseVisualMode(const std::string& s) {
     if (s == "bars-middle") return VisualMode::BarsMiddle;
     if (s == "matrix") return VisualMode::Matrix;
     if (s == "checkerboard") return VisualMode::Checkerboard;
+    if (s == "oscilloscope") return VisualMode::Oscilloscope;
+    if (s == "bands") return VisualMode::BandMeters;
     return VisualMode::BarsLeft;
 }
 
@@ -52,6 +56,8 @@ inline std::string visualModeName(VisualMode mode) {
         case VisualMode::BarsMiddle: return "bars-middle";
         case VisualMode::Matrix: return "matrix";
         case VisualMode::Checkerboard: return "checkerboard";
+        case VisualMode::Oscilloscope: return "oscilloscope";
+        case VisualMode::BandMeters: return "bands";
     }
     return "bars-left";
 }

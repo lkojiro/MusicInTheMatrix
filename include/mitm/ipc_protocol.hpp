@@ -117,6 +117,7 @@ struct StateMessage {
 // state changes) -- see ChildBroadcastSink in host.cpp.
 struct AudioFrameMessage {
     std::vector<float> buckets;
+    std::vector<float> waveform;
     float loudness = 0.0f;
     bool beatDetected = false;
 };
@@ -160,6 +161,7 @@ inline nlohmann::json toJson(const StateMessage& m) {
 inline nlohmann::json toJson(const AudioFrameMessage& m) {
     return {{"type", "audio_frame"},
             {"buckets", m.buckets},
+            {"waveform", m.waveform},
             {"loudness", m.loudness},
             {"beat_detected", m.beatDetected}};
 }

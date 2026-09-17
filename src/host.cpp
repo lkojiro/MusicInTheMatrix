@@ -34,6 +34,27 @@ void handleSigint(int /*signal*/) {
     g_stopRequested = true;
 }
 
+// Downsamples a kWindowSize-long raw PCM window down to kWaveformPointCount
+// points for OscilloscopeRenderer, by simple stride decimation (picking
+// every Nth sample) rather than averaging -- averaging would flatten the
+// peaks/troughs that make a waveform trace worth looking at, the same way
+// it would flatten a sine wave's amplitude; picking representative samples
+// preserves the wave's shape instead. Mirrors rowMagnitude() in
+// curses_util.cpp in spirit (both exist to shrink a wire payload before
+// it's sent), just with a different downsampling strategy suited to a
+// time-domain trace instead of frequency magnitudes.
+std::vector<float> downsampleWaveform(const std::vector<float>& samples, size_t pointCount) {
+    std::vector<float> out;
+    if (samples.empty() || pointCount == 0) return out;
+    out.reserve(pointCount);
+    size_t n = samples.size();
+    for (size_t i = 0; i < pointCount; ++i) {
+        size_t idx = i * n / pointCount;
+        out.push_back(samples[idx]);
+    }
+    return out;
+}
+
 struct Child {
     long windowHandle = -1; // -1 unless spawn-token-correlated (see below)
     std::unique_ptr<UnixSocketConnection> connection;
@@ -122,6 +143,7 @@ public:
     void onFrame(const AudioFrame& frame) override {
         ipc::AudioFrameMessage msg;
         msg.buckets = frame.buckets;
+        msg.waveform = frame.waveform;
         msg.loudness = frame.loudness;
         msg.beatDetected = frame.beatDetected;
         nlohmann::json json = ipc::toJson(msg);
@@ -527,11 +549,13 @@ int runHost(const AppArgs& args) {
         if (audioOk) {
             audio.readLatest(samples, kWindowSize);
             fft.process(samples, frame.buckets);
+            frame.waveform = downsampleWaveform(samples, kWaveformPointCount);
             AudioFeatures features = beatDetector.update(samples, frame.buckets);
             frame.loudness = features.loudness;
             frame.beatDetected = features.beatDetected;
         } else {
             frame.buckets.assign(kBucketCount, 0.0f);
+            frame.waveform.assign(kWaveformPointCount, 0.0f);
         }
         for (auto& sink : sinks) sink->onFrame(frame);
 

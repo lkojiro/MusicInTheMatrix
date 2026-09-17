@@ -115,6 +115,8 @@ with an error listing the input devices it did find.
 ./build/mitm --visual=bars-middle         # bucket 0 centered, mirrored outward
 ./build/mitm --visual=matrix              # starts in Matrix rain mode
 ./build/mitm --visual=checkerboard        # starts in Checkerboard mode
+./build/mitm --visual=oscilloscope        # starts in Oscilloscope (time-domain waveform) mode
+./build/mitm --visual=bands               # starts in Bands (low/mid/high VU meters) mode
 ./build/mitm --color=purple               # any mode, any color (default green)
 ```
 
@@ -260,7 +262,7 @@ of the above, as a manual/scriptable alternative that doesn't rely on
 auto-discovery:
 
 ```sh
-./build/mitm --controller [--count=N] [--socket=PATH] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard] [--color=NAME]
+./build/mitm --controller [--count=N] [--socket=PATH] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard|oscilloscope|bands] [--color=NAME]
                                            # spawns N Terminal windows up front and rotates
                                            # which one is "active" every 5s. Doesn't run the
                                            # central audio pipeline the default host does (see
@@ -550,6 +552,14 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
 - `FftProcessor`: applies a Hann window, runs a real FFT via KissFFT, and
   groups bins into log-spaced magnitude buckets (linear bucketing would
   leave most bars flat, since musical energy skews toward low frequencies).
+  Bucket magnitudes then get an exponential gain boost that grows with
+  frequency (`highFrequencyGain()`, 1x at the lowest bucket up to
+  `kHighFrequencyBoost` at the highest) -- without it, bass buckets read
+  as almost always maxed out and treble buckets barely register at all,
+  since real audio carries far more raw energy at the low end than the
+  high end regardless of how loud the treble actually sounds in context.
+  This affects every bucket-driven mode (Bars, Bands), not just one,
+  since it's applied once at the source.
 - `BeatDetector`: RMS loudness (adaptive running-max normalized) plus
   spectral-flux beat pulses (adaptive mean+stddev threshold, refractory
   period) -- see the license writeup above for why this is hand-rolled.
@@ -595,6 +605,211 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   characters -- as it darkens (`Shrink`). See **A real ncurses rendering
   bug** below -- its color path looks nothing like a naive attron/mvaddch
   loop because of it.
+- `OscilloscopeRenderer` (Oscilloscope mode): a time-domain waveform
+  trace across the full terminal, vertically centered. The trace always
+  stretches to span the full terminal width -- the waveform data is
+  linearly interpolated to exactly one value per screen column
+  regardless of how its point count compares to the terminal's width,
+  rather than one column per point and whatever's left over as padding.
+  A thin line, not a filled bar chart: level segments between columns
+  draw as `-`, and a rising or falling step draws as a `/` or `\` cap on
+  a `|` run for the rows in between -- picked from the slope between
+  each pair of consecutive columns, the same idea as a real scope's
+  traced line; a dim `-` center row marks zero amplitude. Sourced from
+  `AudioFrame::waveform` -- a `config::kWaveformPointCount`-point stride
+  decimation of the host's raw capture window (see `downsampleWaveform()`
+  in `host.cpp`), not the FFT buckets every other mode uses, since a
+  waveform trace needs the actual time-domain shape rather than frequency
+  magnitudes. Like Bars, just one solid full-brightness hue -- no
+  brightness ramp.
+- `BandMeterRenderer` (Bands mode): three vertical VU-meter-style
+  progress bars side by side, each its own bordered box titled "Low",
+  "Mid", or "High". Each bar is a stack of discrete segments (a
+  classic LED VU meter look, not one continuous fill), lighting from the
+  bottom up one segment at a time as that band gets louder. Segments are
+  a fixed height (`kSegmentHeightRows` = 4 rows each, `segmentSpan()`)
+  rather than a fixed *count*: how many segments a bar actually shows
+  (`segmentCount_`) is worked out from the terminal's current height
+  instead (`interiorHeight / kSegmentHeightRows`, floor division, at
+  least 1), with any leftover rows collected into a blank margin above
+  the topmost segment -- deliberately not the same "spread the remainder
+  across the first few pieces" scheme `evenSpan()` uses for the 3 boxes'
+  column widths, since a handful of segments ending up visibly taller
+  than their neighbors at some terminal sizes read as a layout bug. That
+  means a taller terminal shows *more* segments at the same size rather
+  than the same segment count stretched taller, and a shorter one shows
+  fewer rather than every segment getting squeezed thinner -- recomputed
+  alongside the boxes themselves whenever a resize triggers a rebuild.
+  `kSegmentHeightRows` = 4 was picked to match what a fixed 16-segment
+  layout used to work out to at a 67-row terminal (a 65-row box interior
+  divided 16 ways), the height this renderer's spacing originally looked
+  best at, so that terminal height still renders pixel-for-pixel
+  identically now. A segment gets a 1-row gap below it only when its
+  (uniform) height is 2+ rows, so at any given terminal size either every
+  segment the bar shows has a gap or none do, never some but not others
+  (verified directly at terminal heights 67, 99, and 35: each renders the
+  same 4-row-tall segments -- 3 fill rows plus a 1-row gap -- just with
+  more or fewer of them as the interior grows or shrinks). Which of the 64
+  log-spaced FFT buckets belong to which band (low <70Hz, mid
+  70Hz-700Hz, high >700Hz) is worked out once at construction from
+  `FftProcessor::bucketFrequencyRange()` -- a bucket's midpoint frequency
+  decides which band it falls in -- not recomputed every frame. Low
+  fills to its own absolute level (`bandAbsoluteLevel()`: `bandEnergy()`,
+  each band's raw bucket-magnitude sum, averaged by bucket count and
+  clamped to `[0, 1]`) -- it's usually the loudest part of any mix
+  already, so it doesn't need any help standing out. Mid and High
+  instead each average two different readings: that same absolute level,
+  and their band's *percentage of the combined energy across all 3
+  bands* (Low's included in that total, even though Low itself isn't
+  blended this way). Neither alone was right: percentage alone is
+  scale-invariant -- uniformly louder or quieter input shifts every
+  band's sum by the same factor, which cancels out of the ratio -- so
+  Mid/High would sit at a fixed height regardless of how loud the music
+  actually is right now, reflecting spectral *shape* alone and nothing
+  about its actual level (confirmed directly: a uniform signal produced
+  byte-for-byte identical fills for Mid/High whether scaled ×0.01 or
+  ×1.0); absolute level alone is what originally needed fixing, since
+  bass usually carries so much more raw energy that Mid/High read as
+  almost always empty even when they're genuinely doing something
+  (confirmed with a bass-heavy mix: mid/high's own absolute level was
+  near zero, but the blend still filled them to 2/18 rows). Averaging
+  the two keeps both properties: the percentage half gives them the
+  boost they need to ever show up against the bass, the absolute half
+  keeps them moving with the music's actual level instead of just its
+  shape (confirmed: the same signal scaled ×0.01 vs ×1.0 moved Mid from
+  4/18 to 12/18 rows and High from 5/18 to 12/18, rather than staying
+  fixed). That fill fraction drives the lit-segment
+  count directly, every frame, with no peak-hold smoothing of its own --
+  the per-segment fade-out (below) is what keeps the bar from reading as
+  flicker, not a second layer of smoothing on the count itself. It isn't
+  truncated to a whole segment count before that, though: the one
+  segment the level's fractional position actually falls inside targets
+  proportional partial brightness -- however far up through that
+  segment's own range the level sits, quantized to the nearest of the
+  fade ramp's `kFadeLevels` steps -- rather than snapping straight to
+  fully lit the instant the level reaches it, so the meter reads with
+  `segmentCount_ * kFadeLevels` effective brightness increments instead
+  of just `segmentCount_` whole-segment jumps.
+
+  Segment color is a fixed zone by position, not the window's base
+  color: the top ~1/8 of segments are always one hue, the next ~1/4
+  another, the next ~1/4 another, and the rest (the bottom ~1/2) the last
+  (`zoneForSegment()`, thresholds scaled proportionally to the bar's
+  current `segmentCount_` rather than hardcoded absolute counts, each
+  floored to at least 1 segment so every zone still gets a chance to
+  appear even on a short bar) -- a VU meter's 4 zones are a fixed
+  convention, not a cosmetic choice
+  tied to the rest of the UI's color, so `setupColors()` never reads
+  `GlobalConfig::baseColor` and this renderer ignores the web panel's
+  color picker entirely. Which 4 hues fill those zones comes from one of
+  5 fixed color schemes instead (`kSchemeZoneColors`): Default
+  (green/yellow/orange/red bottom-to-top, the original, reading
+  calm-to-intense), Warm (gold at the bottom through deep red at the
+  top), Cool (bright cyan at the bottom through deep blue at the top),
+  Greyscale (white at the bottom through dim grey at the top), and Candy
+  (lime, turquoise, pink, and cyan -- fully saturated like Default, just
+  a punchier, less natural hue set). Warm/Cool/Greyscale deliberately run
+  the opposite direction from Default and Candy, brightest/most
+  saturated at the bottom rather than the top. The up/down keys, "change
+  color" for every
+  other mode, cycle through these schemes here instead of picking a
+  single hue (`nextScheme()`/`prevScheme()`, wired up in
+  `subordinate.cpp`'s arrow-key handling) -- the one thing about this
+  mode's colors that *is* switchable. Lit segments render as reverse
+  video (`COLOR_BLACK` on the zone's color) rather than a colored `#`, so
+  each reads as a solid block, same idea as Checkerboard's lit cells. A
+  segment that stops being lit fades out
+  over `kFadeDurationSeconds` (a 3-step brightness ramp per zone via
+  `makeBrightnessRamp()`) instead of switching off instantly, tracked
+  per segment (`segmentBrightness_` in the header) -- on a
+  256-color terminal only; a basic terminal has no ramp to fade through
+  and just turns off instantly, same restriction Checkerboard's own ramp
+  has.
+
+  Each segment's brightness is one continuous value in `[0, 1]`
+  (`segmentBrightness_`), moved incrementally toward 1 (lit, over
+  `kFadeInDurationSeconds`) or 0 (unlit, over `kFadeDurationSeconds`)
+  each frame -- never reset from a fixed endpoint. That distinction
+  mattered in practice: two independent "time since it turned off"/"time
+  since it turned on" counters used to reset from their own fixed
+  endpoint whenever a segment reversed direction mid-fade (unlit just
+  long enough to start dimming, then lit again before finishing), so it
+  would jump to "freshly off, fading in from black" instead of
+  continuing from wherever it already was -- the actual cause of a
+  flicker where a bar draining down and a bar filling up collided on the
+  same segment. A single brightness value can't do that: reversing
+  direction just means it starts moving the other way from right where
+  it is.
+
+  Fade-outs (descending) cascade top-to-bottom rather than firing in
+  parallel, but not by making a segment wait for the one above it to
+  *completely* finish -- just for it to drop by one brightness step
+  (`kStepBrightness = 1 / kFadeLevels`, see the `aboveBrightness` gate in
+  `draw()`'s pass 1). Once that one-step gate opens it stays open (the
+  gated segment then descends in lockstep with the one above, not
+  re-checking every frame), so the two keep a constant one-step
+  brightness gap between them for the rest of the drain -- a bar
+  draining from full reads as a gradient sweeping down the stack,
+  several segments visibly at different brightness levels at once,
+  rather than each LED fully blinking out before the next one even
+  starts. Fade-ins (ascending) aren't gated by neighbors at all -- every
+  segment is always free to rise as soon as it's lit. This is why
+  `draw()` computes every segment's state in one pass (top segment to
+  bottom, since segment N's descend decision needs segment N-1's
+  already-finalized brightness from this same frame) and only then
+  *paints* them in a second pass, bottom segment to top -- selling the
+  "filling up/emptying out" read by drawing in the same bottom-up order
+  the meter actually fills, even though the final pixels are
+  order-independent (each segment owns disjoint rows) so this second
+  pass's direction is cosmetic where the first pass's is load-bearing.
+
+  Unlike every other renderer, this one keeps its 3 `newwin()` boxes
+  alive across `draw()` calls instead of recreating them every frame --
+  see the `windows_` member and its doc comment in
+  `band_meter_renderer.hpp`. Recreating and re-bordering all 3 boxes on
+  every ~8ms tick was the actual cause of a whole-window flicker
+  (borders included, not just the fill): redrawing alternate-charset
+  box-drawing characters at 125Hz is visibly janky on real terminals
+  even though the final content never changes. Boxes are rebuilt --
+  border, title, and all -- only if the terminal's size actually
+  changes; every other frame only repaints each box's interior fill.
+  That rebuild also erases and refreshes `stdscr` once, immediately
+  before recreating the 3 boxes: `delwin()` only frees the `WINDOW*`
+  structs, it doesn't erase whatever they'd already drawn on screen, so
+  a resize that shrinks the terminal (or otherwise reflows the 3 boxes'
+  widths) used to leave stale border/fill content lingering outside the
+  new, differently-sized boxes' bounds. This clear only runs when a
+  rebuild is already happening -- a real resize, or `invalidate()` after
+  switching into this mode -- not every frame, so it doesn't reintroduce
+  the flicker above.
+
+  A bar's border also goes bold, and its title switches from lowercase
+  ("low") to uppercase ("LOW"), whenever any segment in that bar's top
+  half is still lit or fading -- back to normal/lowercase once none are
+  -- read off `segmentBrightness_` (as just finalized by pass 1, for the
+  same frame) rather than the raw level directly, so the border lags the
+  level exactly as long as that top segment's own fade-out does: the
+  same "sticky" trailing feel the fade already gives the segments
+  themselves, instead of snapping the instant the level dips under half.
+  Same reasoning as the rest of this section otherwise: `box()` (with
+  `A_BOLD` on or off) is only re-run on the actual crossing
+  (`boldBorder_`), not every frame. Since row 0 is a
+  border row, re-running `box()` there erases the title label along with
+  the rest of it, so `bandLabel()` regenerates it (cased to match, and
+  bolded right along with the border) and redraws it immediately after.
+
+  That "only rebuild on resize" check isn't enough on its own, though:
+  switching away to a different mode (or the window going idle) fully
+  repaints the whole screen without this renderer knowing, so switching
+  back to Bands at the same terminal size used to leave stale characters
+  from whatever was on screen before and no border at all, since draw()
+  had no reason to think anything needed rebuilding. `invalidate()`
+  (declared in the header) is the fix: it resets the "last built size"
+  sentinel so the next `draw()` call rebuilds unconditionally, and
+  `subordinate.cpp`'s render loop calls it whenever the *previous*
+  frame's draw call wasn't this same renderer's (tracked via
+  `lastDrawWasBandMeters`), i.e. exactly on the transition into this
+  mode.
 - `curses_util`: shared ncurses lifecycle (`init()`/`teardown()`, owned
   once per run so all three renderers can coexist), `pollInput()` (one
   `getch()` per frame recognizing `q`, the arrow keys, and `n`), the
