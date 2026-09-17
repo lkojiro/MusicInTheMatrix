@@ -653,32 +653,13 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   log-spaced FFT buckets belong to which band (low <70Hz, mid
   70Hz-700Hz, high >700Hz) is worked out once at construction from
   `FftProcessor::bucketFrequencyRange()` -- a bucket's midpoint frequency
-  decides which band it falls in -- not recomputed every frame. Low
-  fills to its own absolute level (`bandAbsoluteLevel()`: `bandEnergy()`,
-  each band's raw bucket-magnitude sum, averaged by bucket count and
-  clamped to `[0, 1]`) -- it's usually the loudest part of any mix
-  already, so it doesn't need any help standing out. Mid and High
-  instead each average two different readings: that same absolute level,
-  and their band's *percentage of the combined energy across all 3
-  bands* (Low's included in that total, even though Low itself isn't
-  blended this way). Neither alone was right: percentage alone is
-  scale-invariant -- uniformly louder or quieter input shifts every
-  band's sum by the same factor, which cancels out of the ratio -- so
-  Mid/High would sit at a fixed height regardless of how loud the music
-  actually is right now, reflecting spectral *shape* alone and nothing
-  about its actual level (confirmed directly: a uniform signal produced
-  byte-for-byte identical fills for Mid/High whether scaled ×0.01 or
-  ×1.0); absolute level alone is what originally needed fixing, since
-  bass usually carries so much more raw energy that Mid/High read as
-  almost always empty even when they're genuinely doing something
-  (confirmed with a bass-heavy mix: mid/high's own absolute level was
-  near zero, but the blend still filled them to 2/18 rows). Averaging
-  the two keeps both properties: the percentage half gives them the
-  boost they need to ever show up against the bass, the absolute half
-  keeps them moving with the music's actual level instead of just its
-  shape (confirmed: the same signal scaled ×0.01 vs ×1.0 moved Mid from
-  4/18 to 12/18 rows and High from 5/18 to 12/18, rather than staying
-  fixed). That fill fraction drives the lit-segment
+  decides which band it falls in -- not recomputed every frame. All 3
+  bands fill to their own absolute level alone (`bandAbsoluteLevel()`:
+  `bandEnergy()`, each band's raw bucket-magnitude sum, averaged by
+  bucket count and clamped to `[0, 1]`) -- no percentage-of-total
+  blending for Mid/High, so each bar reflects how loud that part of the
+  spectrum actually is, not what share of the total spectrum it happens
+  to make up. That fill fraction drives the lit-segment
   count directly, every frame, with no peak-hold smoothing of its own --
   the per-segment fade-out (below) is what keeps the bar from reading as
   flicker, not a second layer of smoothing on the count itself. It isn't
@@ -785,12 +766,13 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
 
   A bar's border also goes bold, and its title switches from lowercase
   ("low") to uppercase ("LOW"), whenever any segment in that bar's top
-  half is still lit or fading -- back to normal/lowercase once none are
-  -- read off `segmentBrightness_` (as just finalized by pass 1, for the
-  same frame) rather than the raw level directly, so the border lags the
-  level exactly as long as that top segment's own fade-out does: the
-  same "sticky" trailing feel the fade already gives the segments
-  themselves, instead of snapping the instant the level dips under half.
+  3/4 is still lit or fading -- i.e. roughly once the bar is a quarter
+  full -- back to normal/lowercase once none are -- read off
+  `segmentBrightness_` (as just finalized by pass 1, for the same frame)
+  rather than the raw level directly, so the border lags the level
+  exactly as long as that segment's own fade-out does: the same "sticky"
+  trailing feel the fade already gives the segments themselves, instead
+  of snapping the instant the level dips under a quarter.
   Same reasoning as the rest of this section otherwise: `box()` (with
   `A_BOLD` on or off) is only re-run on the actual crossing
   (`boldBorder_`), not every frame. Since row 0 is a

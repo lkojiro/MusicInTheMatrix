@@ -123,11 +123,8 @@ void classifyBuckets(std::vector<size_t>& low, std::vector<size_t>& mid, std::ve
 }
 
 // Sum of `buckets` at `indices`, un-normalized -- this band's raw share
-// of spectral energy. Used two ways in draw(): summed across all 3 bands
-// to find each of Mid/High's percentage of the combined total (see
-// there for why), and on its own (via bandAbsoluteLevel() below) for
-// Low, which is deliberately measured differently from its two
-// siblings.
+// of spectral energy. Used by bandAbsoluteLevel() below, which averages
+// it down to a per-bucket level.
 float bandEnergy(const std::vector<float>& buckets, const std::vector<size_t>& indices) {
     float sum = 0.0f;
     for (size_t i : indices) {
@@ -136,15 +133,15 @@ float bandEnergy(const std::vector<float>& buckets, const std::vector<size_t>& i
     return sum;
 }
 
-// Low's own absolute level: bandEnergy() averaged by how many buckets
-// went into it (so Low reads consistently regardless of exactly how many
-// low-frequency buckets classifyBuckets() happened to assign it) and
-// clamped to [0, 1], the same convention every other renderer's
-// magnitude values already follow. Unlike Mid/High (see draw()), this
-// never looks at the other two bands at all -- Low fills according to
-// how loud the bass itself is, not what fraction of the total spectrum
-// it happens to make up, so a quiet mix that's mostly bass doesn't read
-// as a full Low bar just because there's little else going on.
+// A band's own absolute level: bandEnergy() averaged by how many buckets
+// went into it (so a band reads consistently regardless of exactly how
+// many buckets classifyBuckets() happened to assign it) and clamped to
+// [0, 1], the same convention every other renderer's magnitude values
+// already follow. Never looks at the other two bands at all -- a band
+// fills according to how loud that part of the spectrum actually is, not
+// what fraction of the total spectrum it happens to make up, so e.g. a
+// quiet mix that's mostly bass doesn't read as a full Low bar just
+// because there's little else going on.
 float bandAbsoluteLevel(const std::vector<float>& buckets, const std::vector<size_t>& indices) {
     if (indices.empty()) return 0.0f;
     return std::clamp(bandEnergy(buckets, indices) / static_cast<float>(indices.size()), 0.0f, 1.0f);
@@ -197,10 +194,10 @@ struct Band {
 // The box title for `name` -- padded with one leading/trailing space (so
 // callers can center it with a little breathing room from the border),
 // and cased to match the bar's own loudness: upper when it's more than
-// half full, lower otherwise -- the same threshold and the same moment
-// (see the caller's bold-state check) that also bolds the border, so the
-// title reads as shouting when the bar does and stays quiet the rest of
-// the time.
+// a quarter full, lower otherwise -- the same threshold and the same
+// moment (see the caller's bold-state check) that also bolds the
+// border, so the title reads as shouting when the bar does and stays
+// quiet the rest of the time.
 std::string bandLabel(const char* name, bool loud) {
     std::string label = " ";
     for (const char* p = name; *p != '\0'; ++p) {
@@ -389,39 +386,13 @@ void BandMeterRenderer::draw(const std::vector<float>& buckets) {
         }
     }
 
-    // Mid and High each fill to an even blend of two different readings:
-    // their band's own absolute level (bandAbsoluteLevel(), same
-    // measure Low uses) and their percentage of the combined energy
-    // across all 3 bands (Low's included in that total, even though Low
-    // itself isn't blended in this way -- see below). Neither alone was
-    // right: percentage on its own is scale-invariant, so Mid/High would
-    // sit at the same height whether the music's overall level just
-    // dropped or not, completely decoupled from how loud things actually
-    // are; absolute level on its own is what originally needed fixing --
-    // bass usually carries so much more raw energy that Mid/High read as
-    // almost always empty even when they're genuinely doing something.
-    // Averaging the two keeps both properties at once: the percentage
-    // half gives them the relative boost they need to ever show up
-    // against the bass, while the absolute half keeps them moving up and
-    // down with the music's actual level instead of just its spectral
-    // shape. Low fills to its own absolute level alone instead
-    // (bandAbsoluteLevel()) -- it's usually the loudest part of any mix
-    // already, so it doesn't need the percentage half's boost the way
-    // its siblings do. Computed once here, up front, since a percentage
-    // inherently needs all 3 sums (Low's included) before Mid/High's
-    // share of the total can be worked out; totalEnergy == 0 (true
-    // silence) leaves both bands' percentage half at 0 rather than
-    // dividing by zero.
-    float lowEnergy = bandEnergy(buckets, lowBuckets_);
-    float midEnergy = bandEnergy(buckets, midBuckets_);
-    float highEnergy = bandEnergy(buckets, highBuckets_);
-    float totalEnergy = lowEnergy + midEnergy + highEnergy;
-    float midPercentage = totalEnergy > 0.0f ? midEnergy / totalEnergy : 0.0f;
-    float highPercentage = totalEnergy > 0.0f ? highEnergy / totalEnergy : 0.0f;
+    // All 3 bands fill to their own absolute level alone
+    // (bandAbsoluteLevel()) -- no percentage-of-total blending for any
+    // of them (see the class doc comment for why).
     std::array<float, 3> fillFraction = {
         bandAbsoluteLevel(buckets, lowBuckets_),
-        (bandAbsoluteLevel(buckets, midBuckets_) + midPercentage) / 2.0f,
-        (bandAbsoluteLevel(buckets, highBuckets_) + highPercentage) / 2.0f,
+        bandAbsoluteLevel(buckets, midBuckets_),
+        bandAbsoluteLevel(buckets, highBuckets_),
     };
 
     // Every frame, regardless: repaint just each box's interior fill --
@@ -444,13 +415,12 @@ void BandMeterRenderer::draw(const std::vector<float>& buckets) {
             continue;
         }
 
-        // This band's fill fraction, computed above (Low: its own
-        // absolute level; Mid/High: percentage of the combined total) --
-        // no peak-hold smoothing here either way; the per-segment
-        // fade-out below is what keeps this from reading as flicker
-        // (each segment lingers, dimming, for kFadeDurationSeconds after
-        // it turns off, rather than the whole bar's height itself
-        // needing to decay gradually to feel stable).
+        // This band's own absolute level, computed above -- no
+        // peak-hold smoothing here; the per-segment fade-out below is
+        // what keeps this from reading as flicker (each segment
+        // lingers, dimming, for kFadeDurationSeconds after it turns
+        // off, rather than the whole bar's height itself needing to
+        // decay gradually to feel stable).
         float raw = fillFraction[static_cast<size_t>(i)];
 
         // Not truncated -- the fractional part is exactly how far into
@@ -485,20 +455,21 @@ void BandMeterRenderer::draw(const std::vector<float>& buckets) {
         float aboveBrightness = 0.0f;
 
         // The border goes bold, and the title switches from lowercase to
-        // uppercase, whenever any segment in the top half of the bar is
-        // still lit or fading -- not the instantaneous raw level itself.
-        // Reading it off segmentBrightness_ (as each segment's finalized
-        // just below, for this same frame) rather than `raw` directly
-        // makes the bold state track what the bar is actually *showing*
-        // -- including a top segment's own lingering fade-out -- so it
-        // stays bold a little after the level itself dips back under
-        // half, the same "sticky" trailing feel the fade already gives
-        // the segments themselves, rather than snapping off exactly on
-        // the instant. Folded into this same pass rather than a second
-        // scan afterward -- segmentFromBottom/brightness are already
-        // right here, finalized for this segment, so there's nothing a
-        // separate pass over the top half would see that this one
-        // doesn't.
+        // uppercase, whenever any segment in the top 3/4 of the bar is
+        // still lit or fading -- i.e. whenever the level has reached
+        // roughly a quarter full, not the instantaneous raw level
+        // itself. Reading it off segmentBrightness_ (as each segment's
+        // finalized just below, for this same frame) rather than `raw`
+        // directly makes the bold state track what the bar is actually
+        // *showing* -- including a top segment's own lingering fade-out
+        // -- so it stays bold a little after the level itself dips back
+        // under a quarter, the same "sticky" trailing feel the fade
+        // already gives the segments themselves, rather than snapping
+        // off exactly on the instant. Folded into this same pass rather
+        // than a second scan afterward -- segmentFromBottom/brightness
+        // are already right here, finalized for this segment, so
+        // there's nothing a separate pass over the top 3/4 would see
+        // that this one doesn't.
         bool shouldBeBold = false;
 
         for (int s = 0; s < segmentCount_; ++s) {
@@ -547,7 +518,7 @@ void BandMeterRenderer::draw(const std::vector<float>& buckets) {
             }
             aboveBrightness = brightness;
 
-            if (segmentFromBottom >= segmentCount_ / 2 && brightness > 0.0f) {
+            if (segmentFromBottom >= segmentCount_ / 4 && brightness > 0.0f) {
                 shouldBeBold = true;
             }
 

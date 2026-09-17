@@ -10,13 +10,14 @@ namespace mitm {
 // Three vertical VU-meter-style progress bars -- low (<80Hz), mid
 // (80Hz-700Hz), and high (>700Hz) -- each its own bordered ncurses box
 // titled "Low"/"Mid"/"High" (upper case and bold, see boldBorder_ below,
-// whenever any segment in the top half of the bar is still lit or
-// fading; lower case and plain otherwise) -- deliberately reading off
-// whether the bar is still *showing* anything in its top half rather
-// than the instantaneous raw level, so this lags the level exactly as
-// long as that top segment's own fade-out does, the same "sticky"
-// trailing feel the fade already gives the segments themselves, instead
-// of the border snapping the instant the level dips under half. Each bar
+// whenever any segment in the top 3/4 of the bar is still lit or
+// fading -- i.e. roughly whenever the bar is a quarter full; lower case
+// and plain otherwise) -- deliberately reading off whether the bar is
+// still *showing* anything up there rather than the instantaneous raw
+// level, so this lags the level exactly as long as that segment's own
+// fade-out does, the same "sticky" trailing feel the fade already gives
+// the segments themselves, instead of the border snapping the instant
+// the level dips under a quarter. Each bar
 // is a stack of discrete segments, not one continuous fill -- a classic
 // LED VU meter look, lighting from the bottom up one segment at a time
 // as that band gets louder, a thin gap between segments where there's
@@ -76,23 +77,11 @@ namespace mitm {
 // every segment is always free to rise toward lit as soon as it should
 // be.
 //
-// Low's lit-segment count is its band's own absolute level
-// (bandAbsoluteLevel() in the .cpp) -- it's usually the loudest part of
-// any mix already, so it doesn't need any help standing out. Mid and
-// High instead each average two different readings: that same absolute
-// level, and their band's percentage of the combined energy across all
-// 3 bands (bandEnergy()). Neither alone was right: percentage alone is
-// scale-invariant (uniformly louder or quieter input shifts every
-// band's sum by the same factor, which cancels out of the ratio), so
-// Mid/High would sit at a fixed height regardless of how loud the music
-// actually is right now -- completely decoupled from its level, only
-// ever reflecting spectral *shape*; absolute level alone is what
-// originally needed fixing, since bass usually carries so much more raw
-// energy that Mid/High read as almost always empty even when they're
-// genuinely doing something. Averaging the two keeps both properties:
-// the percentage half gives them the boost they need to ever show up
-// against the bass, the absolute half keeps them moving with the
-// music's actual level rather than just its shape. No peak-hold
+// Each bar's lit-segment count is its own band's absolute level alone
+// (bandAbsoluteLevel() in the .cpp) -- no cross-band percentage/share
+// blending; Low, Mid, and High are all measured the same way, so a bar
+// fills according to how loud that part of the spectrum actually is,
+// not what fraction of the total it happens to make up. No peak-hold
 // smoothing on any of this -- the per-segment fade above is what keeps
 // a bar from reading as flicker (each segment lingers, dimming, after
 // it turns off) rather than a second layer of smoothing on top of it.
@@ -226,7 +215,7 @@ private:
     int builtScreenHeight_ = -1;
 
     // Whether each bar's border is currently drawn bold (index 0/1/2 =
-    // low/mid/high) -- true whenever any segment in that bar's top half
+    // low/mid/high) -- true whenever any segment in that bar's top 3/4
     // is still lit or fading (see the class doc comment for why that's
     // read off segmentBrightness_ rather than the raw level directly).
     // draw() only re-runs box() when this actually flips, not every
