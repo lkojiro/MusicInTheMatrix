@@ -10,12 +10,14 @@ namespace mitm::ipc {
 
 // Wire protocol between the controller process and subordinate visualizer
 // processes, exchanged as newline-free JSON objects over a length-prefixed
-// framing (see UnixSocketConnection). Deliberately tiny: the controller
-// mainly tells a subordinate whether it's the "active" (live-rendering)
-// window right now, or asks it to quit. Subordinates run their own
-// AudioCapture/FftProcessor pipeline independently -- no audio or frame
-// data crosses this socket, which keeps the protocol trivial and avoids
-// any bandwidth/sync concerns as the number of windows grows.
+// framing (see UnixSocketConnection). Most of this is deliberately tiny --
+// the controller mainly tells a subordinate whether it's the "active"
+// (live-rendering) window right now, or asks it to quit. The one
+// exception is AudioFrameMessage: the host runs the only
+// AudioCapture/FftProcessor/BeatDetector pipeline (see AudioEventSink) and
+// broadcasts its output to every connected subordinate once per
+// processing tick, since subordinates no longer run that pipeline
+// themselves.
 
 // Subordinate -> controller (or child -> host), sent once right after
 // connecting. `id` is the connecting process's own pid (unique without
@@ -107,6 +109,18 @@ struct StateMessage {
     std::string colorName;
 };
 
+// Host -> subordinate, broadcast to every connected subordinate once per
+// processing tick: the current audio-reactive data (see AudioFrame in
+// audio_event_sink.hpp), now that subordinates no longer capture/analyze
+// audio themselves. Unlike every other message here, this one is sent at
+// a real cadence (matched to the host's own capture tick, not just on
+// state changes) -- see ChildBroadcastSink in host.cpp.
+struct AudioFrameMessage {
+    std::vector<float> buckets;
+    float loudness = 0.0f;
+    bool beatDetected = false;
+};
+
 inline nlohmann::json toJson(const HelloMessage& m) {
     return {{"type", "hello"}, {"id", m.id}, {"pid", m.pid}, {"spawn_token", m.spawnToken}};
 }
@@ -141,6 +155,13 @@ inline nlohmann::json toJson(const SetColorMessage& m) {
 
 inline nlohmann::json toJson(const StateMessage& m) {
     return {{"type", "state"}, {"mode", m.mode}, {"color_name", m.colorName}};
+}
+
+inline nlohmann::json toJson(const AudioFrameMessage& m) {
+    return {{"type", "audio_frame"},
+            {"buckets", m.buckets},
+            {"loudness", m.loudness},
+            {"beat_detected", m.beatDetected}};
 }
 
 // Returns the "type" field, or an empty string if the message is malformed.

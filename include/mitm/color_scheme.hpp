@@ -56,6 +56,16 @@ BaseColor parseColorName(const std::string& name);
 // least deterministic/reproducible run to run.
 std::string colorNameForIndex(int index);
 
+// Cycles through the 7 named presets (red, green, blue, yellow, cyan,
+// magenta, white -- same set --color/parseColorName recognize, "purple"
+// treated as the "magenta" slot) in that fixed order, wrapping both ways.
+// Driven by the up/down arrow keys (see curses_util::InputAction) the
+// same way nextVisualMode()/prevVisualMode() drive left/right -- an
+// unrecognized `name` is treated as if it were "green", matching
+// parseColorName()'s own fallback.
+std::string nextColorName(const std::string& name);
+std::string prevColorName(const std::string& name);
+
 // Nearest basic ANSI color (1-7: red/green/yellow/blue/magenta/cyan/
 // white) for terminals without a 256-color palette, where a brightness
 // ramp isn't possible at all -- just picks the color whose channels are

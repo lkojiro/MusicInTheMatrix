@@ -42,6 +42,35 @@ BaseColor parseColorName(const std::string& name) {
     return {0, 5, 0}; // default: green
 }
 
+namespace {
+
+// The fixed cycle order for nextColorName()/prevColorName() -- the same
+// 7 presets parseColorName() recognizes, canonical names only ("purple"
+// is an alias, not its own slot).
+constexpr std::array<const char*, 7> kColorCycle = {
+    "red", "green", "blue", "yellow", "cyan", "magenta", "white",
+};
+
+int colorCycleIndex(const std::string& name) {
+    std::string canonical = name == "purple" ? "magenta" : name;
+    for (size_t i = 0; i < kColorCycle.size(); ++i) {
+        if (canonical == kColorCycle[i]) return static_cast<int>(i);
+    }
+    return 1; // green -- matches parseColorName()'s own fallback
+}
+
+} // namespace
+
+std::string nextColorName(const std::string& name) {
+    size_t idx = static_cast<size_t>(colorCycleIndex(name));
+    return kColorCycle[(idx + 1) % kColorCycle.size()];
+}
+
+std::string prevColorName(const std::string& name) {
+    size_t idx = static_cast<size_t>(colorCycleIndex(name));
+    return kColorCycle[(idx + kColorCycle.size() - 1) % kColorCycle.size()];
+}
+
 std::string colorNameForIndex(int index) {
     static const std::array<const char*, 6> kRotation = {
         "red", "blue", "yellow", "cyan", "magenta", "white",

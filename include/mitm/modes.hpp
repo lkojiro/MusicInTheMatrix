@@ -50,7 +50,14 @@ namespace mitm {
 // appears -- a window spawned via 'n' (host.cpp's spawnChild()) or by
 // --controller gets its own auto-rotated color instead of inheriting the
 // spawning window's, so windows are visually distinguishable by default;
-// see colorNameForIndex() in color_scheme.hpp.
+// see colorNameForIndex() in color_scheme.hpp. Meaningless on the host's
+// own command line now: the host doesn't render anything itself (see
+// runHost below), so it has no color of its own to set.
+//
+// --device likewise no longer applies to a subordinate: subordinates
+// don't open their own audio device anymore, only the host does (see
+// AudioEventSink in audio_event_sink.hpp) -- --device on the host's own
+// command line is what picks its capture device.
 struct AppArgs {
     bool controller = false;
     bool subordinate = false;
@@ -72,12 +79,16 @@ struct AppArgs {
 
 AppArgs parseArgs(int argc, char** argv);
 
-// The host: renders its own window (like the old standalone mode) AND
-// orchestrates -- accepts child connections and activates each
-// immediately (every window renders live simultaneously, no rotation),
-// broadcasts GlobalConfig updates, spawns new windows on 'n' (its own or
+// The host: a dedicated, non-visualizing orchestrator. Runs the one
+// AudioCapture/FftProcessor/BeatDetector pipeline for the whole setup and
+// broadcasts its output to every connected child once per tick (see
+// AudioEventSink in audio_event_sink.hpp) -- accepts child connections
+// and activates each immediately (every window renders live
+// simultaneously, no rotation), spawns new windows on 'n' (its own or
 // relayed from a child's), and cascades shutdown to every child when it
-// quits. See src/host.cpp.
+// quits. Its own terminal just shows a status screen (app name, version,
+// connected windows) via curses_util::drawHostStatus -- all actual
+// visualization happens in subordinate windows. See src/host.cpp.
 int runHost(const AppArgs& args);
 
 int runSubordinate(const AppArgs& args);

@@ -160,30 +160,33 @@ inside an existing window), and exactly one of them ends up as host.
   missing, the pid is dead, or the connection fails, it becomes the host
   itself. `UnixSocketServer` already cleans up a stale socket file at its
   bind path, so a crashed host's leftovers don't need special handling.
-- **The host renders too, and every window is live simultaneously.**
-  Unlike the old `--controller` mode (a pure background orchestrator that
-  rotates which one window is "active" and idles the rest), the host is a
-  real, visible window -- standalone's old render loop merged with the
-  orchestration logic -- and every connected child is activated the
-  moment it connects and never deactivated. No rotation, no idling: as
-  many windows as are open all show live visuals at once.
+- **The host doesn't render a visualizer; every child window does, live
+  and simultaneously.** The host is a dedicated orchestrator: it runs the
+  one `AudioCapture`/`FftProcessor`/`BeatDetector` pipeline for the whole
+  setup and broadcasts its output to every connected child (see **Audio
+  pipeline** below), but its own terminal just shows a small status
+  screen (`curses_util::drawHostStatus()` -- app name, version, connected
+  windows, quit/spawn key prompts), not a visualizer. Every connected
+  child is activated the moment it connects and never deactivated -- no
+  rotation, no idling, as many windows as are open all show live visuals
+  at once.
 - **Windows are titled and numbered for human readability, not by pid.**
   Each window's terminal tab title (set via the xterm OSC 0 escape
   sequence, `curses_util::setWindowTitle()` -- consumed by the terminal
   emulator itself, safe to call any time, never touches the character
   grid) shows a small, gap-free display number instead of its real pid:
-  the host is always `mitm — HOST (0)`, and children are
-  `mitm — CHILD (1)`, `(2)`, etc., in connection order. The host tracks
-  this order itself (`windowOrder` in `host.cpp`, seeded with its own id
-  at index 0 and never removed) and rebroadcasts the full ordered id list
-  via `ipc::ConfigMessage` on every connect/disconnect; each child just
-  finds its own real id's position in that list and retitles itself to
-  match. Removing a disconnected id from the middle of that list
-  naturally closes the gap for everyone after it -- a child never needs
-  an explicit "renumber" message, just the same broadcast it already
-  gets. The real id (pid, or a spawn-token-correlated window handle)
-  never changes and is still what every internal map is keyed by; only
-  the label shown to the user does.
+  children are titled `mitm — CHILD (0)`, `(1)`, etc., in connection
+  order (the host doesn't occupy a slot in this numbering -- it isn't a
+  visualizer window itself). The host tracks this order (`windowOrder` in
+  `host.cpp`) and rebroadcasts the full ordered id list via
+  `ipc::ConfigMessage` on every connect/disconnect; each child just finds
+  its own real id's position in that list and retitles itself to match.
+  Removing a disconnected id from the middle of that list naturally
+  closes the gap for everyone after it -- a child never needs an explicit
+  "renumber" message, just the same broadcast it already gets. The real
+  id (pid, or a spawn-token-correlated window handle) never changes and
+  is still what every internal map is keyed by; only the label shown to
+  the user does.
 - **`n` works from any window, host or child.** Only the host actually
   holds a `WindowLauncher` and the spawn-token bookkeeping needed to
   later `close()` what it spawns, so a child doesn't spawn directly --
@@ -259,31 +262,44 @@ auto-discovery:
 ```sh
 ./build/mitm --controller [--count=N] [--socket=PATH] [--visual=bars-left|bars-right|bars-middle|matrix|checkerboard] [--color=NAME]
                                            # spawns N Terminal windows up front and rotates
-                                           # which one is "active" every 5s, without rendering
-                                           # anything itself (unlike the host).
+                                           # which one is "active" every 5s. Doesn't run the
+                                           # central audio pipeline the default host does (see
+                                           # below), so subordinates spawned this way render
+                                           # without audio reactivity for now.
 
-./build/mitm --subordinate --id=N --socket=PATH [--device=NAME] [--visual=...] [--color=NAME]
+./build/mitm --subordinate --id=N --socket=PATH [--visual=...] [--color=NAME]
                                            # what --controller launches in each window.
+                                           # --device is meaningless here now --
+                                           # subordinates don't open an audio device
+                                           # themselves; only the host does.
 ```
 
-Each subordinate runs its own independent `AudioCapture` → `FftProcessor`
-→ `BeatDetector` pipeline and just gates whether it actually renders based
-on activate/deactivate messages from the controller -- no audio or frame
-data crosses the socket, only tiny control messages (`hello`, `activate`,
-`bye`, `shutdown`, `config`, `spawn_request`, `set_mode`, `set_color`,
-`state`), which keeps the protocol trivial regardless of how many windows
-are running.
+The (default, auto-discovered) host runs the *only* `AudioCapture` →
+`FftProcessor` → `BeatDetector` pipeline in the whole setup, and
+broadcasts its output to every connected subordinate once per processing
+tick via `ipc::AudioFrameMessage` (see `AudioEventSink` in
+`audio_event_sink.hpp`) -- subordinates just render whatever they most
+recently received, gated on activate/deactivate messages from the host,
+rather than capturing/analyzing audio themselves. Every other message
+here stays tiny and event-driven as before (`hello`, `activate`, `bye`,
+`shutdown`, `config`, `spawn_request`, `set_mode`, `set_color`, `state`);
+`audio_frame` is the one exception, sent at a real cadence regardless of
+how many windows are running. (The explicit `--controller` path below
+doesn't run this pipeline, so subordinates spawned through it don't get
+audio reactivity yet.)
 
 ## Web control panel
 
 The host also serves a small web UI, at `http://127.0.0.1:7887` by
 default (override with `--web-port=N`) -- see `control_server.hpp`. One
 page, no build step, no external requests (everything it does is a
-`fetch()` back to this same server): a row per window (host included),
-each with a mode dropdown, a color dropdown, and a Close button (the
-host's row says "Quit All" instead, since closing window 0 *is* closing
-the host -- same cascade as `q`), plus a "+ Spawn Window" button and a
-"🎲 Randomize All" one. It polls `GET /api/state` once a second and just
+`fetch()` back to this same server): a row per connected subordinate
+window (the host itself doesn't appear here -- it doesn't render
+anything, so there's no mode/color of its own to control; quitting it is
+a `q` in its own terminal, which still cascades to every subordinate),
+each with a mode dropdown, a color dropdown, and a Close button, plus a
+"+ Spawn Window" button and a "🎲 Randomize All" one. It polls `GET
+/api/state` once a second and just
 re-renders; every action (`POST /api/spawn`, `/api/close`, `/api/mode`,
 `/api/color`, the latter three taking a small JSON body keyed by the
 window's *display* number, never its real pid) fires and waits for the
@@ -318,20 +334,20 @@ Two real gotchas this surfaced:
 
 Only the host runs this -- it's the only process with a view of every
 window, so it's the natural single control point (same reasoning as `n`
-already being relayed to the host from a child, see above). Controlling
-a *child's* mode/color is just the host sending it the new
-`ipc::SetModeMessage`/`ipc::SetColorMessage`; controlling the host's own
-is the same request touching this process's own `GlobalConfig`/mode
-variable directly. Both color-carrying renderers
-(`CheckerboardRenderer`/`MatrixRainRenderer`) only ever read
-`GlobalConfig::baseColor` once, in their constructor -- so applying a
-live color change means explicitly re-running their `setupColors()`
-(now public for exactly this) rather than just mutating the config and
-expecting it to show up. That re-run has to happen on the thread that
-owns the ncurses session, never a background reader thread (same rule as
-every other ncurses call in this codebase), which is why both host.cpp's
-main loop and subordinate.cpp's diff a locally-tracked "last applied"
-snapshot once a frame rather than acting the moment the message arrives.
+already being relayed to the host from a child, see above). The host
+doesn't have a mode/color of its own to control (it doesn't render
+anything), so every `/api/mode`/`/api/color` request just means sending
+the target child the new `ipc::SetModeMessage`/`ipc::SetColorMessage`.
+Each color-carrying renderer (`CheckerboardRenderer`/`MatrixRainRenderer`)
+only ever reads `GlobalConfig::baseColor` once, in its constructor -- so
+applying a live color change on the *child* that receives it means
+explicitly re-running `setupColors()` (public for exactly this) rather
+than just mutating the config and expecting it to show up. That re-run
+has to happen on the thread that owns the ncurses session, never a
+background reader thread (same rule as every other ncurses call in this
+codebase), which is why `subordinate.cpp`'s main loop diffs a
+locally-tracked "last applied" snapshot once a frame rather than acting
+the moment the message arrives.
 
 Mode is simpler -- `draw()` already reads the current mode fresh every
 frame -- but a window's mode can *also* change locally (the arrow keys
@@ -503,8 +519,9 @@ because anything currently needs their full capability:
   **Multi-window** above -- a child's reader thread derives its own
   display number by finding its id's position in this same list, not
   just mirroring it for its own sake. Populated differently per mode: the
-  host derives it from `windowOrder` (its own id first, then children in
-  connection order) and broadcasts an `ipc::ConfigMessage` to every
+  host derives it directly from `windowOrder` (children in connection
+  order -- the host itself doesn't render, so it isn't part of this list)
+  and broadcasts an `ipc::ConfigMessage` to every
   connected child whenever the set changes (a connect or disconnect --
   see `broadcastConfig()` in `host.cpp`), which a child's reader thread
   applies via `updateGlobalConfig()`. Since every plain launch now goes
@@ -580,17 +597,24 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   loop because of it.
 - `curses_util`: shared ncurses lifecycle (`init()`/`teardown()`, owned
   once per run so all three renderers can coexist), `pollInput()` (one
-  `getch()` per frame recognizing `q`, the arrow keys, and `n`), and the
-  shared idle screen for windows that aren't currently active.
+  `getch()` per frame recognizing `q`, the arrow keys, and `n`), the
+  shared idle screen for windows that aren't currently active, and
+  `drawHostStatus()` for the host's own (non-visualizing) status screen.
 - `visual_mode.hpp`: the `VisualMode` enum and `next`/`prev`/`parse`
   helpers arrow-key switching cycles through.
 - `main.cpp` / `args.cpp`: parse CLI args and dispatch to host discovery
   (the default), or the explicit `--controller`/`--subordinate` modes.
 - `host_discovery.hpp`: the `/tmp/.mitm-host` lock file read/write/
   liveness-check helpers `main.cpp` uses to decide host-vs-child.
-- `host.cpp`: `runHost` -- standalone's old single-window render loop
-  merged with orchestration (accept children, activate each on connect,
-  broadcast `GlobalConfig`, cascade shutdown). See **Multi-window** above.
+- `host.cpp`: `runHost` -- the orchestrator: accepts children, activates
+  each on connect, runs the one audio pipeline for the whole setup and
+  broadcasts its output to every child (`ChildBroadcastSink`, see
+  `audio_event_sink.hpp`), cascades shutdown, and draws its own status
+  screen. Doesn't render a visualizer itself. See **Multi-window** above.
+- `audio_event_sink.hpp`: `AudioFrame` and `AudioEventSink`, the
+  publisher/subscriber interface the host's audio pipeline fans its
+  per-tick output out through -- `ChildBroadcastSink` in `host.cpp` is the
+  only implementation today.
 - `unix_socket.cpp`, `ipc_protocol.hpp`: the length-prefixed JSON transport
   and its tiny message schema.
 - `window_launcher.cpp`: `AppleScriptWindowLauncher`, spawning/closing
@@ -627,9 +651,12 @@ third_party/json/        Vendored nlohmann/json single header (pinned to v3.11.3
   disconnect at any time via `n` or manual launches) -- it's only the
   explicit `--controller` mode that still spawns a fixed set once at
   startup.
-- Every subordinate independently opens the same loopback device -- this
-  worked fine in testing (CoreAudio/BlackHole supports multiple
-  simultaneous readers), but hasn't been stress-tested with many windows.
+- Only the host opens the loopback device now (see **Audio pipeline**
+  above) -- a `runSubordinate` process never captures audio itself
+  regardless of how it was spawned, which means the explicit
+  `--controller` path (which doesn't run the host's audio pipeline or
+  send `audio_frame`) currently leaves its subordinates with no audio
+  reactivity at all, not degraded/independent reactivity as before.
 - macOS/Terminal.app-only: `AppleScriptWindowLauncher` and
   `currentExecutablePath()` (via `_NSGetExecutablePath`) are both
   Darwin-specific. `WindowLauncher` is the seam for a Linux/other-emulator

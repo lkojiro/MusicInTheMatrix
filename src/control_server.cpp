@@ -39,17 +39,12 @@ constexpr const char* kControlPanelHtml = R"HTML(<!doctype html>
   }
   button:hover, select:hover { border-color: #555; }
   button.primary { border-color: #3a6; color: #6f6; }
-  button.danger { border-color: #a33; color: #f66; }
   table { border-collapse: collapse; width: 100%; max-width: 720px; }
   th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #222; }
   th { color: #777; font-weight: normal; font-size: 12px; text-transform: uppercase; }
   .swatch {
     display: inline-block; width: 10px; height: 10px; border-radius: 50%;
     margin-right: 6px; vertical-align: middle;
-  }
-  .host-badge {
-    background: #143; color: #6f6; border-radius: 3px; padding: 1px 6px;
-    font-size: 11px; margin-left: 6px;
   }
   #banner {
     display: none; background: #400; color: #faa; padding: 8px 12px;
@@ -85,15 +80,12 @@ function optionsFor(list, current) {
 function render(windows) {
   const rows = document.getElementById("rows");
   rows.innerHTML = windows.map(w => {
-    const label = w.isHost ? `Host <span class="host-badge">0</span>` : `Window ${w.displayNumber}`;
-    const closeLabel = w.isHost ? "Quit All" : "Close";
-    const closeClass = w.isHost ? "danger" : "";
     const swatch = SWATCH_HEX[w.colorName] || "#555";
     return `<tr>
-      <td><span class="swatch" style="background:${swatch}"></span>${label}</td>
+      <td><span class="swatch" style="background:${swatch}"></span>Window ${w.displayNumber}</td>
       <td><select onchange="setMode(${w.displayNumber}, this.value)">${optionsFor(MODES, w.mode)}</select></td>
       <td><select onchange="setColor(${w.displayNumber}, this.value)">${optionsFor(COLORS, w.colorName)}</select></td>
-      <td><button class="${closeClass}" onclick="closeWindow(${w.displayNumber})">${closeLabel}</button></td>
+      <td><button onclick="closeWindow(${w.displayNumber})">Close</button></td>
     </tr>`;
   }).join("");
 }

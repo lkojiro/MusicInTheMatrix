@@ -6,12 +6,9 @@
 
 #include <unistd.h> // getpid
 
-#include "mitm/audio_capture.hpp"
-#include "mitm/beat_detector.hpp"
 #include "mitm/checkerboard_renderer.hpp"
 #include "mitm/color_scheme.hpp"
 #include "mitm/curses_util.hpp"
-#include "mitm/fft_processor.hpp"
 #include "mitm/global_config.hpp"
 #include "mitm/ipc_protocol.hpp"
 #include "mitm/matrix_rain_renderer.hpp"
@@ -47,6 +44,22 @@ struct SharedState {
     std::atomic<VisualMode> mode{VisualMode::BarsLeft};
     std::mutex colorNameMutex; // guards colorName (not atomic-friendly)
     std::string colorName;
+
+    // The host now runs the only audio pipeline and broadcasts its output
+    // here once per tick (see ipc::AudioFrameMessage) -- this window no
+    // longer captures or analyzes audio itself. buckets needs a mutex
+    // (not atomic-friendly); loudness is a single float so plain atomic
+    // works. beatPending is deliberately consume-and-cleared by the main
+    // loop (see runSubordinate()'s exchange(false) below) rather than just
+    // read, so a detected beat is rendered exactly once regardless of the
+    // relative timing between the host's send cadence and this window's
+    // own render cadence -- matching BeatDetector::AudioFeatures'
+    // original "true for exactly one update() call" contract, now across
+    // a socket instead of within one process.
+    std::mutex audioMutex;
+    std::vector<float> buckets;
+    std::atomic<float> loudness{0.0f};
+    std::atomic<bool> beatPending{false};
 };
 
 // Connects to the controller, sends hello, and spins up a background
@@ -117,6 +130,14 @@ std::unique_ptr<UnixSocketConnection> connectAndHandshake(const AppArgs& args, s
                 // Actually applying this (re-running the renderers'
                 // setupColors()) has to happen on the main thread -- see
                 // runSubordinate()'s per-frame diff check.
+            } else if (type == "audio_frame") {
+                auto bucketsJson = msg.value("buckets", nlohmann::json::array());
+                std::lock_guard<std::mutex> lock(state.audioMutex);
+                state.buckets.clear();
+                state.buckets.reserve(bucketsJson.size());
+                for (auto& v : bucketsJson) state.buckets.push_back(v.get<float>());
+                state.loudness = msg.value("loudness", 0.0f);
+                if (msg.value("beat_detected", false)) state.beatPending = true;
             } else if (type == "shutdown") {
                 break;
             }
@@ -160,29 +181,10 @@ int runSubordinate(const AppArgs& args) {
         c.windows = {WindowInfo{args.id}};
     });
 
-    // Audio is best-effort, for both modes: arrow keys can switch this
-    // window to bars at any time regardless of the starting mode, and
-    // Matrix rain still works (just without loudness/beat reactivity) if
-    // this fails.
-    AudioCapture audio(kSampleRate, 1 << 15, args.deviceNameHint);
-    bool audioOk = audio.start();
-    if (!audioOk) {
-        std::fprintf(stderr,
-                      "Subordinate %d: no audio input (%s) -- bars mode will show as just the baseline; "
-                      "Matrix rain will run without music reactivity.\n",
-                      args.id, audio.lastError().c_str());
-    }
-
-    FftProcessor fft(kSampleRate, kWindowSize, kBucketCount);
-    BeatDetector beatDetector;
-
     curses_util::init();
     TerminalRenderer barsRenderer;
     MatrixRainRenderer matrixRenderer;
     CheckerboardRenderer checkerboardRenderer;
-
-    std::vector<float> samples;
-    std::vector<float> buckets;
 
     // What the host last heard from us, for the per-frame diff check
     // below. lastReportedColorName starts empty (never a real preset
@@ -193,7 +195,8 @@ int runSubordinate(const AppArgs& args) {
     std::string lastReportedColorName;
 
     while (!state.shutdownRequested.load()) {
-        switch (curses_util::pollInput()) {
+        curses_util::InputAction action = curses_util::pollInput();
+        switch (action) {
             case curses_util::InputAction::Quit:
                 state.shutdownRequested = true;
                 break;
@@ -203,6 +206,25 @@ int runSubordinate(const AppArgs& args) {
             case curses_util::InputAction::PrevMode:
                 state.mode = prevVisualMode(state.mode.load());
                 break;
+            case curses_util::InputAction::NextColor:
+            case curses_util::InputAction::PrevColor: {
+                // Same "local change" handling as the reader thread's
+                // set_color case below (updateGlobalConfig() *and*
+                // state.colorName, since setupColors() -- called from the
+                // per-frame diff check further down -- reads the color
+                // back out of GlobalConfig, not state) -- just triggered
+                // by up/down here instead of a remote command.
+                std::string newColor;
+                {
+                    std::lock_guard<std::mutex> lock(state.colorNameMutex);
+                    newColor = action == curses_util::InputAction::NextColor
+                                   ? nextColorName(state.colorName)
+                                   : prevColorName(state.colorName);
+                    state.colorName = newColor;
+                }
+                updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(newColor); });
+                break;
+            }
             case curses_util::InputAction::SpawnWindow:
                 // We don't have our own WindowLauncher (or, in the
                 // host/child path, the spawn-token bookkeeping needed to
@@ -249,15 +271,19 @@ int runSubordinate(const AppArgs& args) {
         }
 
         if (state.active.load()) {
-            float loudness = 0.0f;
-            bool beatDetected = false;
-            if (audioOk) {
-                audio.readLatest(samples, kWindowSize);
-                fft.process(samples, buckets);
-                AudioFeatures features = beatDetector.update(samples, buckets);
-                loudness = features.loudness;
-                beatDetected = features.beatDetected;
+            // Sourced entirely from the host's audio_frame broadcasts now
+            // (see SharedState's doc comment) -- this window doesn't
+            // capture or analyze audio itself anymore. beatPending is a
+            // true consume-and-clear so a detected beat is rendered
+            // exactly once, regardless of how this loop's cadence lines
+            // up with the host's send cadence.
+            std::vector<float> buckets;
+            {
+                std::lock_guard<std::mutex> lock(state.audioMutex);
+                buckets = state.buckets;
             }
+            float loudness = state.loudness.load();
+            bool beatDetected = state.beatPending.exchange(false);
 
             switch (currentMode) {
                 case VisualMode::BarsLeft:
@@ -293,7 +319,6 @@ int runSubordinate(const AppArgs& args) {
     conn->shutdown();                                  // unblock reader's receive()
     reader.join();
 
-    if (audioOk) audio.stop();
     return 0;
 }
 

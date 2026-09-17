@@ -11,20 +11,16 @@
 #include <unistd.h> // getpid
 
 #include "mitm/audio_capture.hpp"
+#include "mitm/audio_event_sink.hpp"
 #include "mitm/beat_detector.hpp"
-#include "mitm/checkerboard_renderer.hpp"
 #include "mitm/color_scheme.hpp"
 #include "mitm/control_server.hpp"
 #include "mitm/curses_util.hpp"
 #include "mitm/fft_processor.hpp"
-#include "mitm/global_config.hpp"
 #include "mitm/host_discovery.hpp"
 #include "mitm/ipc_protocol.hpp"
-#include "mitm/matrix_rain_renderer.hpp"
 #include "mitm/modes.hpp"
-#include "mitm/terminal_renderer.hpp"
 #include "mitm/unix_socket.hpp"
-#include "mitm/visual_mode.hpp"
 #include "mitm/visualizer_config.hpp"
 #include "mitm/window_launcher.hpp"
 
@@ -83,37 +79,63 @@ void waitAndCloseWindows(std::mutex& childrenMutex, std::unordered_map<int, Chil
     }
 }
 
-// Sends every connected child the host's current view of the window set,
-// and updates the host's own GlobalConfig the same way. Caller must
-// already hold childrenMutex.
+// Sends every connected child the host's current view of the window set.
+// Caller must already hold childrenMutex.
 //
 // windowOrder carries more than membership: its *order* is what every
-// window (host included) derives its simple, human-readable display
-// number from -- position 0 is the host (windowOrder is seeded with
-// ownId at construction and that entry is never removed), and each
-// child's position is its 1-based slot in connection order. Removing a
-// disconnected id from the middle of this vector naturally closes the
-// gap for everyone after it, so the set of display numbers in use is
-// always exactly 0..n-1 with nothing to explicitly renumber -- each
-// child just recomputes "where am I in the list I was just sent" on
-// every broadcast. The real id (pid, or spawn-token-correlated window
-// handle) stays exactly what it always was; this is purely a label.
-void broadcastConfig(int ownId, const std::vector<int>& windowOrder,
-                      std::unordered_map<int, Child>& children) {
+// child derives its simple, human-readable display number from -- the
+// host itself no longer renders anything and so no longer occupies a
+// slot in this list (unlike the old rendering host, which always
+// reserved position 0 for itself). Removing a disconnected id from the
+// middle of this vector naturally closes the gap for everyone after it,
+// so the set of display numbers in use is always exactly 0..n-1 with
+// nothing to explicitly renumber -- each child just recomputes "where am
+// I in the list I was just sent" on every broadcast. The real id (pid,
+// or spawn-token-correlated window handle) stays exactly what it always
+// was; this is purely a label.
+void broadcastConfig(const std::vector<int>& windowOrder, std::unordered_map<int, Child>& children) {
     ipc::ConfigMessage msg;
     msg.windowIds = windowOrder;
     msg.windowCount = static_cast<int>(msg.windowIds.size());
-
-    updateGlobalConfig([&](GlobalConfig& c) {
-        c.windowCount = msg.windowCount;
-        c.windows.clear();
-        for (int id : msg.windowIds) c.windows.push_back(WindowInfo{id});
-    });
 
     for (auto& [id, child] : children) {
         if (child.connection) child.connection->send(ipc::toJson(msg));
     }
 }
+
+// The one AudioEventSink this process registers today: fans out the
+// host's centrally-computed AudioFrame to every connected subordinate
+// over its existing control-socket connection. Locks childrenMutex for
+// the duration, same as every other piece of code that touches
+// `children` -- UnixSocketConnection makes no thread-safety guarantee of
+// its own, so this and the control server's per-window sends (see
+// runHost below) rely on that lock to stay serialized relative to each
+// other. Adding a future subscriber type (e.g. a UDP broadcast to
+// external hardware) means writing another AudioEventSink implementation
+// and registering it alongside this one -- this class, and the loop that
+// calls it, don't change.
+class ChildBroadcastSink : public AudioEventSink {
+public:
+    ChildBroadcastSink(std::mutex& childrenMutex, std::unordered_map<int, Child>& children)
+        : childrenMutex_(childrenMutex), children_(children) {}
+
+    void onFrame(const AudioFrame& frame) override {
+        ipc::AudioFrameMessage msg;
+        msg.buckets = frame.buckets;
+        msg.loudness = frame.loudness;
+        msg.beatDetected = frame.beatDetected;
+        nlohmann::json json = ipc::toJson(msg);
+
+        std::lock_guard<std::mutex> lock(childrenMutex_);
+        for (auto& [id, child] : children_) {
+            if (child.connection) child.connection->send(json);
+        }
+    }
+
+private:
+    std::mutex& childrenMutex_;
+    std::unordered_map<int, Child>& children_;
+};
 
 } // namespace
 
@@ -124,10 +146,7 @@ int runHost(const AppArgs& args) {
 
     int ownId = static_cast<int>(::getpid());
 
-    // The host is always display number 0 -- it's windowOrder[0] below and
-    // that entry is never removed, so unlike children this never needs to
-    // be recomputed or re-sent.
-    curses_util::setWindowTitle("mitm — HOST (0)");
+    curses_util::setWindowTitle("mitm — HOST");
 
     // Best-effort: a failed lock file write just means other instances
     // won't be able to discover us this session (they'll each become
@@ -145,12 +164,6 @@ int runHost(const AppArgs& args) {
         removeHostLockFileIfOwnedBy(ownId);
         return 1;
     }
-
-    updateGlobalConfig([&](GlobalConfig& c) {
-        c.baseColor = parseColorName(args.colorName);
-        c.windowCount = 1;
-        c.windows = {WindowInfo{ownId}};
-    });
 
     std::mutex childrenMutex;
     std::unordered_map<int, Child> children;
@@ -175,9 +188,10 @@ int runHost(const AppArgs& args) {
     std::unordered_map<std::string, int> pendingHellos;
     long spawnCounter = 0;
 
-    // Connection order, host first -- see the broadcastConfig() doc
-    // comment above for why this drives display numbers.
-    std::vector<int> windowOrder{ownId};
+    // Connection order -- see the broadcastConfig() doc comment above for
+    // why this drives display numbers. The host itself doesn't render
+    // anything and so never occupies a slot here.
+    std::vector<int> windowOrder;
 
     // Declared up here (rather than down with the rest of the render
     // setup, where the equivalent host-side 'n' handling used to live)
@@ -209,8 +223,10 @@ int runHost(const AppArgs& args) {
             // inheriting this host's --color -- see colorNameForIndex().
             spawnColor = colorNameForIndex(static_cast<int>(index));
         }
-        std::string command = "'" + execPath + "' --device='" + args.deviceNameHint + "' --color='" +
-                               spawnColor + "' --spawn-token='" + token + "'; exit";
+        // No --device: subordinates no longer open their own audio device
+        // (the host is the only process that captures audio now).
+        std::string command =
+            "'" + execPath + "' --color='" + spawnColor + "' --spawn-token='" + token + "'; exit";
         // Blocks for ~0.3-1s (AppleScript/Terminal overhead) -- fine off
         // the main render thread, but do the actual spawn() call outside
         // the lock so it doesn't stall the accept thread or other
@@ -267,11 +283,21 @@ int runHost(const AppArgs& args) {
                 // rotation, so a newly-connected child is activated right
                 // away rather than waiting its turn.
                 child.connection->send(ipc::toJson(ipc::ActivateMessage{true}));
-                broadcastConfig(ownId, windowOrder, children);
+                broadcastConfig(windowOrder, children);
             }
-            std::printf("Host: window %d connected\n", id);
+            // No connect/disconnect logging to stdout here (there used to
+            // be) -- this host's terminal is an ncurses screen for its
+            // whole lifetime (see curses_util::init() below), and raw
+            // stdio writes while ncurses owns the terminal corrupt its
+            // display instead of appearing as a clean log: ncurses redraws
+            // from its own in-memory model every tick, which doesn't
+            // account for bytes written outside its control, so the
+            // result is visual corruption that can persist rather than a
+            // readable log line. The connected-window list drawHostStatus
+            // renders every tick already carries this same information
+            // live.
 
-            std::thread([&childrenMutex, &children, &windowOrder, &spawnChild, ownId, id, connPtr] {
+            std::thread([&childrenMutex, &children, &windowOrder, &spawnChild, &launcher, id, connPtr] {
                 nlohmann::json msg;
                 while (connPtr->receive(msg)) {
                     std::string type = ipc::messageType(msg);
@@ -294,55 +320,57 @@ int runHost(const AppArgs& args) {
                         }
                     }
                 }
-                std::lock_guard<std::mutex> lock(childrenMutex);
-                children.erase(id);
-                windowOrder.erase(std::remove(windowOrder.begin(), windowOrder.end(), id),
-                                   windowOrder.end());
-                broadcastConfig(ownId, windowOrder, children);
-                std::printf("Host: window %d disconnected\n", id);
+                long handle = -1;
+                {
+                    std::lock_guard<std::mutex> lock(childrenMutex);
+                    auto it = children.find(id);
+                    if (it != children.end()) handle = it->second.windowHandle;
+                    children.erase(id);
+                    windowOrder.erase(std::remove(windowOrder.begin(), windowOrder.end(), id),
+                                       windowOrder.end());
+                    broadcastConfig(windowOrder, children);
+                }
+                // This child disconnected on its own (e.g. 'q' in its own
+                // window) rather than through closeChildAsync or full
+                // host shutdown -- neither of which runs for this path --
+                // so without this, a window spawned via 'n' would never
+                // actually close, just sit there showing "[Process
+                // completed]" after its process exits. Reuses
+                // waitAndCloseWindows purely for its grace-delay-then-
+                // close step: passing no ids to wait on since this child
+                // is already erased from `children` above.
+                if (handle >= 0) {
+                    std::thread([&childrenMutex, &children, &launcher, handle] {
+                        waitAndCloseWindows(childrenMutex, children, launcher, {}, {handle});
+                    }).detach();
+                }
             }).detach();
         }
     });
 
-    // Audio is best-effort: arrow keys can switch to bars at any time
-    // regardless of the starting mode, and Matrix rain still works (just
-    // without loudness/beat reactivity) if this fails.
+    // The host runs the only audio pipeline now -- best-effort, same as
+    // before: subordinates just won't get any loudness/beat reactivity if
+    // this fails, but the whole setup still comes up.
     AudioCapture audio(kSampleRate, 1 << 15, args.deviceNameHint);
     bool audioOk = audio.start();
     if (!audioOk) {
         std::fprintf(stderr,
-                      "Host: no audio input (%s) -- bars mode will show as just the baseline; "
-                      "Matrix rain will run without music reactivity.\n",
+                      "Host: no audio input (%s) -- connected windows will show as just the "
+                      "baseline, without music reactivity.\n",
                       audio.lastError().c_str());
     }
 
     FftProcessor fft(kSampleRate, kWindowSize, kBucketCount);
     BeatDetector beatDetector;
 
-    curses_util::init();
-    TerminalRenderer barsRenderer;
-    MatrixRainRenderer matrixRenderer;
-    CheckerboardRenderer checkerboardRenderer;
-
-    // Atomic (not a plain local) because the control server's HTTP
-    // handler thread below also writes it, controlling the host's own
-    // window the same way a remote SetModeMessage controls a child's --
-    // see control_server.hpp.
-    std::atomic<VisualMode> mode{parseVisualMode(args.visualMode)};
-
-    // The host's own color *name* -- GlobalConfig only carries the
-    // parsed BaseColor, not the string the control server's dashboard
-    // wants to display/round-trip in a <select>. Lives under
-    // childrenMutex alongside windowOrder/children (not its own mutex),
-    // since the dashboard reads all of it together as one snapshot.
-    std::string hostColorName = args.colorName;
-    // What color this process last actually applied to
-    // matrixRenderer/checkerboardRenderer -- compared against
-    // GlobalConfig::baseColor once a frame below so a control-server-
-    // driven color change (which can only safely touch GlobalConfig,
-    // not ncurses, from that request-handling thread) gets picked up
-    // and applied on the main thread, which owns the ncurses session.
-    BaseColor lastAppliedColor = parseColorName(args.colorName);
+    // Every AudioEventSink this process fans its per-tick AudioFrame out
+    // to. Just one today (broadcasting to connected subordinates over
+    // their control-socket connections) -- a future subscriber type (e.g.
+    // a UDP broadcast to external hardware) is another AudioEventSink
+    // implementation pushed onto this vector, with nothing below it
+    // needing to change.
+    std::vector<std::unique_ptr<AudioEventSink>> sinks;
+    sinks.push_back(std::make_unique<ChildBroadcastSink>(childrenMutex, children));
 
     // Sends `id` a shutdown message and closes its window once it
     // actually disconnects, without blocking the caller -- see
@@ -370,8 +398,8 @@ int runHost(const AppArgs& args) {
     // The web control panel -- see control_server.hpp for the transport
     // and the embedded page itself. Every route below runs on whichever
     // per-connection thread ControlServer handed the request to, so
-    // anything touching children/windowOrder/hostColorName takes
-    // childrenMutex, same as every other thread that touches them.
+    // anything touching children/windowOrder takes childrenMutex, same as
+    // every other thread that touches them.
     // Best-effort, same philosophy as audio above: a taken port (e.g. a
     // previous host that didn't shut down cleanly, or something else on
     // this machine using it) shouldn't crash the whole visualizer --
@@ -386,18 +414,11 @@ int runHost(const AppArgs& args) {
                     std::lock_guard<std::mutex> lock(childrenMutex);
                     for (size_t i = 0; i < windowOrder.size(); ++i) {
                         int id = windowOrder[i];
+                        auto it = children.find(id);
                         nlohmann::json w;
                         w["displayNumber"] = static_cast<int>(i);
-                        if (id == ownId) {
-                            w["isHost"] = true;
-                            w["mode"] = visualModeName(mode.load());
-                            w["colorName"] = hostColorName;
-                        } else {
-                            w["isHost"] = false;
-                            auto it = children.find(id);
-                            w["mode"] = it != children.end() ? it->second.mode : "";
-                            w["colorName"] = it != children.end() ? it->second.colorName : "";
-                        }
+                        w["mode"] = it != children.end() ? it->second.mode : "";
+                        w["colorName"] = it != children.end() ? it->second.colorName : "";
                         windows.push_back(w);
                     }
                 }
@@ -432,46 +453,28 @@ int runHost(const AppArgs& args) {
             }
 
             if (req.method == "POST" && req.path == "/api/close") {
-                if (realId == ownId) {
-                    // Closing "window 0" means closing the host -- which
-                    // cascades to every child anyway (see the shutdown
-                    // code below), so that's exactly what quitting via
-                    // 'q' does.
-                    g_stopRequested = true;
-                } else {
-                    closeChildAsync(realId);
-                }
+                closeChildAsync(realId);
                 return HttpResponse{200, "application/json", "{\"ok\":true}"};
             }
 
             if (req.method == "POST" && req.path == "/api/mode") {
                 std::string modeName = body.value("mode", std::string("bars"));
-                if (realId == ownId) {
-                    mode = parseVisualMode(modeName);
-                } else {
-                    std::lock_guard<std::mutex> lock(childrenMutex);
-                    auto it = children.find(realId);
-                    if (it != children.end() && it->second.connection) {
-                        it->second.connection->send(ipc::toJson(ipc::SetModeMessage{modeName}));
-                        it->second.mode = modeName; // optimistic -- the child's own state echo will confirm
-                    }
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                auto it = children.find(realId);
+                if (it != children.end() && it->second.connection) {
+                    it->second.connection->send(ipc::toJson(ipc::SetModeMessage{modeName}));
+                    it->second.mode = modeName; // optimistic -- the child's own state echo will confirm
                 }
                 return HttpResponse{200, "application/json", "{\"ok\":true}"};
             }
 
             if (req.method == "POST" && req.path == "/api/color") {
                 std::string colorName = body.value("color", std::string("green"));
-                if (realId == ownId) {
-                    updateGlobalConfig([&](GlobalConfig& c) { c.baseColor = parseColorName(colorName); });
-                    std::lock_guard<std::mutex> lock(childrenMutex);
-                    hostColorName = colorName;
-                } else {
-                    std::lock_guard<std::mutex> lock(childrenMutex);
-                    auto it = children.find(realId);
-                    if (it != children.end() && it->second.connection) {
-                        it->second.connection->send(ipc::toJson(ipc::SetColorMessage{colorName}));
-                        it->second.colorName = colorName; // optimistic, as above
-                    }
+                std::lock_guard<std::mutex> lock(childrenMutex);
+                auto it = children.find(realId);
+                if (it != children.end() && it->second.connection) {
+                    it->second.connection->send(ipc::toJson(ipc::SetColorMessage{colorName}));
+                    it->second.colorName = colorName; // optimistic, as above
                 }
                 return HttpResponse{200, "application/json", "{\"ok\":true}"};
             }
@@ -483,72 +486,68 @@ int runHost(const AppArgs& args) {
         std::fprintf(stderr, "Host: web control panel unavailable (%s) -- continuing without it\n", e.what());
     }
 
+    // Every printf/fprintf above this point happens on a normal terminal;
+    // from here on the terminal belongs to ncurses (curses_util::init()
+    // enters its alternate screen), so nothing below this line should
+    // write to stdout/stderr directly -- see the accept thread's comment
+    // above for why that corrupts the display instead of just logging to
+    // it.
+    curses_util::init();
+
+    constexpr const char* kAppVersion = "0.1.0"; // placeholder
+
     std::vector<float> samples;
-    std::vector<float> buckets;
 
     while (!g_stopRequested.load()) {
         switch (curses_util::pollInput()) {
             case curses_util::InputAction::Quit:
                 g_stopRequested = true;
                 break;
-            case curses_util::InputAction::NextMode:
-                mode = nextVisualMode(mode.load());
-                break;
-            case curses_util::InputAction::PrevMode:
-                mode = prevVisualMode(mode.load());
-                break;
             case curses_util::InputAction::SpawnWindow:
                 // Blocks for ~0.3-1s (AppleScript/Terminal overhead) --
-                // this window's own rendering visibly pauses for that
-                // stretch, same as it always did.
+                // this window's own status screen visibly pauses for that
+                // stretch, same as rendering used to.
                 spawnChild();
+                break;
+            case curses_util::InputAction::NextMode:
+            case curses_util::InputAction::PrevMode:
+            case curses_util::InputAction::NextColor:
+            case curses_util::InputAction::PrevColor:
+                // Nothing to cycle -- the host doesn't visualize anything
+                // itself anymore.
                 break;
             case curses_util::InputAction::None:
                 break;
         }
         if (g_stopRequested.load()) break;
 
-        // Pick up a color change made via the control server -- it can
-        // only safely touch GlobalConfig from its own thread, not
-        // ncurses, so applying it (redefining the renderers' color
-        // pairs) happens here instead, once a frame.
-        BaseColor currentColor = getGlobalConfig().baseColor;
-        if (currentColor != lastAppliedColor) {
-            barsRenderer.setupColors();
-            matrixRenderer.setupColors();
-            checkerboardRenderer.setupColors();
-            lastAppliedColor = currentColor;
-        }
-
-        // The host always renders -- every window (host and every
-        // connected child) shows live visuals simultaneously, no rotation.
-        float loudness = 0.0f;
-        bool beatDetected = false;
+        // Compute this tick's audio data once, then fan it out to every
+        // registered sink -- see AudioEventSink's doc comment.
+        AudioFrame frame;
         if (audioOk) {
             audio.readLatest(samples, kWindowSize);
-            fft.process(samples, buckets);
-            AudioFeatures features = beatDetector.update(samples, buckets);
-            loudness = features.loudness;
-            beatDetected = features.beatDetected;
+            fft.process(samples, frame.buckets);
+            AudioFeatures features = beatDetector.update(samples, frame.buckets);
+            frame.loudness = features.loudness;
+            frame.beatDetected = features.beatDetected;
+        } else {
+            frame.buckets.assign(kBucketCount, 0.0f);
         }
+        for (auto& sink : sinks) sink->onFrame(frame);
 
-        switch (mode.load()) {
-            case VisualMode::BarsLeft:
-                barsRenderer.draw(buckets, BarLayout::Left);
-                break;
-            case VisualMode::BarsRight:
-                barsRenderer.draw(buckets, BarLayout::Right);
-                break;
-            case VisualMode::BarsMiddle:
-                barsRenderer.draw(buckets, BarLayout::Middle);
-                break;
-            case VisualMode::Matrix:
-                matrixRenderer.draw(loudness, beatDetected);
-                break;
-            case VisualMode::Checkerboard:
-                checkerboardRenderer.draw(loudness, beatDetected);
-                break;
+        std::vector<std::string> windowLines;
+        {
+            std::lock_guard<std::mutex> lock(childrenMutex);
+            for (size_t i = 0; i < windowOrder.size(); ++i) {
+                auto it = children.find(windowOrder[i]);
+                bool hasMode = it != children.end() && !it->second.mode.empty();
+                std::string mode = hasMode ? it->second.mode : "connecting...";
+                std::string color = it != children.end() ? it->second.colorName : "";
+                windowLines.push_back("Window " + std::to_string(i) + ": " + mode +
+                                       (color.empty() ? "" : " / " + color));
+            }
         }
+        curses_util::drawHostStatus(kAppVersion, windowLines, frame.buckets);
 
         std::this_thread::sleep_for(kFrameInterval);
     }
