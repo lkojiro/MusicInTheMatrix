@@ -64,6 +64,3 @@ spawn/close/randomize for every open window.
 - **From-scratch HTTP server**: a minimal, dependency-free HTTP/1.1 server
   (`ControlServer`) powers the web control panel — no framework, consistent
   with the project's hand-rolled IPC transport.
-
-See `NOTES.md` (untracked) for the full design-decision log, known rough
-edges, and war stories from a few gnarly ncurses/AppleScript bugs.
